@@ -1,0 +1,180 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Vicebot Dashboard</title>
+  <link rel="stylesheet" href="styles.css">
+</head>
+<body>
+  <div class="container">
+    <!-- Header -->
+    <header class="header">
+      <h1>
+        Incidencias 
+        <span id="connStatus" class="conn-status conn-polling" title="Estado de conexión">●</span>
+      </h1>
+      <div class="header-actions">
+        <span class="text-muted">Última sync: <span id="lastSync">—</span></span>
+        <button id="btnReports" class="btn btn-secondary">📊 Reportes</button>
+        <button id="btnRefresh" class="btn btn-primary">↻ Actualizar</button>
+      </div>
+    </header>
+
+    <!-- Filtros -->
+    <section class="filters">
+      <div class="filter-row">
+        <input type="text" id="qInput" class="form-input" placeholder="Buscar por folio, lugar, descripción...">
+        
+        <select id="areaSel" class="form-select">
+          <option value="">Todas las áreas</option>
+          <option value="man">MAN</option>
+          <option value="it">IT</option>
+          <option value="ama">AMA</option>
+          <option value="rs">RS</option>
+          <option value="seg">SEG</option>
+        </select>
+        
+        <select id="limitSel" class="form-select">
+          <option value="25">25</option>
+          <option value="50" selected>50</option>
+          <option value="100">100</option>
+        </select>
+      </div>
+      
+      <div class="chips">
+        <button class="chip is-active" data-status="">Todos</button>
+        <button class="chip" data-status="open">Abiertos</button>
+        <button class="chip" data-status="in_progress">En Progreso</button>
+        <button class="chip" data-status="done">Completados</button>
+        <button class="chip" data-status="canceled">Cancelados</button>
+      </div>
+    </section>
+
+    <!-- Tabla -->
+    <section class="table-container">
+      <table class="table">
+        <thead>
+          <tr>
+            <th>Folio</th>
+            <th>Fecha</th>
+            <th>Estado</th>
+            <th>Área</th>
+            <th>Ubicación</th>
+            <th>Descripción</th>
+          </tr>
+        </thead>
+        <tbody id="tbody"></tbody>
+      </table>
+      
+      <div id="emptyBox" class="empty-box hidden">No hay incidencias</div>
+    </section>
+
+    <!-- Paginación -->
+    <section class="pager">
+      <button id="btnPrev" class="btn" disabled>← Anterior</button>
+      <span id="rangeLbl" class="range-label">—</span>
+      <button id="btnNext" class="btn" disabled>Siguiente →</button>
+    </section>
+  </div>
+
+  <!-- Modal de detalle -->
+  <div id="detailOverlay" class="overlay hidden">
+    <div class="modal">
+      <button id="btnClose" class="btn-close">✕</button>
+      <div id="detailPanel" class="detail-content"></div>
+    </div>
+  </div>
+
+  <!-- Modal de reportes -->
+  <div id="reportsOverlay" class="overlay hidden">
+    <div class="modal modal-reports">
+      <button id="btnCloseReports" class="btn-close">✕</button>
+      
+      <div class="reports-content">
+        <h2>Generar Reporte de Incidencias</h2>
+        
+        <!-- Filtros -->
+        <section class="reports-filters">
+          <div class="filter-group">
+            <label>Rango de Fechas</label>
+            <div class="date-range">
+              <input type="date" id="reportStartDate" class="form-input">
+              <span>—</span>
+              <input type="date" id="reportEndDate" class="form-input">
+            </div>
+          </div>
+          
+          <div class="filter-group">
+            <label>Áreas</label>
+            <div class="checkbox-group">
+              <label><input type="checkbox" value="man" checked> Mantenimiento</label>
+              <label><input type="checkbox" value="it" checked> IT</label>
+              <label><input type="checkbox" value="ama" checked> AMA</label>
+              <label><input type="checkbox" value="rs" checked> Room Service</label>
+              <label><input type="checkbox" value="seg" checked> Seguridad</label>
+              <label><input type="checkbox" value="exp" checked> Experiencias</label>
+            </div>
+          </div>
+          
+          <div class="filter-group">
+            <label>Estados</label>
+            <div class="checkbox-group">
+              <label><input type="checkbox" value="open" checked> Abiertos</label>
+              <label><input type="checkbox" value="in_progress" checked> En Progreso</label>
+              <label><input type="checkbox" value="done" checked> Completados</label>
+              <label><input type="checkbox" value="canceled" checked> Cancelados</label>
+            </div>
+          </div>
+          
+          <div class="reports-actions">
+            <button id="btnPreviewReport" class="btn btn-secondary">👁️ Vista Previa</button>
+            <button id="btnGenerateReport" class="btn btn-primary">📥 Generar Excel</button>
+          </div>
+        </section>
+        
+        <!-- Vista previa -->
+        <section id="reportsPreview" class="reports-preview hidden">
+          <h3>Vista Previa</h3>
+          
+          <div id="reportsStats" class="reports-stats"></div>
+          
+          <div class="preview-table-container">
+            <table class="table">
+              <thead>
+                <tr>
+                  <th>Folio</th>
+                  <th>Fecha</th>
+                  <th>Estado</th>
+                  <th>Área</th>
+                  <th>Ubicación</th>
+                  <th>Descripción</th>
+                </tr>
+              </thead>
+              <tbody id="reportsPreviewBody"></tbody>
+            </table>
+          </div>
+          
+          <div class="preview-note">
+            <small>Esta es una muestra de hasta 100 registros. El reporte completo incluirá todos los registros que cumplan los filtros.</small>
+          </div>
+        </section>
+        
+        <!-- Estado de generación -->
+        <div id="reportGenerating" class="report-status hidden">
+          <div class="spinner"></div>
+          <p>Generando reporte...</p>
+        </div>
+        
+        <div id="reportSuccess" class="report-status hidden">
+          <div class="success-icon">✓</div>
+          <p>Reporte generado exitosamente</p>
+          <a id="reportDownloadLink" class="btn btn-primary" download>⬇️ Descargar Excel</a>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <script src="app.js"></script>
+</body>
+</html>
