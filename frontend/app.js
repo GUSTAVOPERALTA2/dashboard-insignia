@@ -1,17 +1,137 @@
-// app.js - Dashboard Vicebot Frontend (con Chat de Comentarios)
+// app.js - Dashboard Vicebot Frontend (CON AUTENTICACIÓN)
 
 (function() {
   'use strict';
 
-  // ───────────────────────────────────────────────────────────
-  // Helpers
-  // ───────────────────────────────────────────────────────────
+  // ════════════════════════════════════════════════════
+  // AUTENTICACIÓN
+  // ════════════════════════════════════════════════════
+
+  function getAuthToken() {
+    return localStorage.getItem('auth_token');
+  }
+
+  function logout() {
+    localStorage.removeItem('auth_token');
+    localStorage.removeItem('user_data');
+    window.location.href = '/login.html';
+  }
+
+  // Exponer logout globalmente para el botón
+  window.logout = logout;
+
+  // ════════════════════════════════════════════════════
+  // AUTO-LOGOUT POR INACTIVIDAD (5 minutos)
+  // ════════════════════════════════════════════════════
+  
+  const INACTIVITY_TIMEOUT = 5 * 60 * 1000; // 5 minutos
+  let inactivityTimer = null;
+
+  function resetInactivityTimer() {
+    if (inactivityTimer) {
+      clearTimeout(inactivityTimer);
+    }
+    
+    inactivityTimer = setTimeout(() => {
+      console.log('[AUTH] Session expired due to inactivity');
+      alert('Tu sesión ha expirado por inactividad. Inicia sesión nuevamente.');
+      logout();
+    }, INACTIVITY_TIMEOUT);
+  }
+
+  // Detectar actividad del usuario
+  if (window.location.pathname !== '/login.html') {
+    const activityEvents = ['mousedown', 'mousemove', 'keypress', 'scroll', 'touchstart', 'click'];
+    
+    activityEvents.forEach(eventName => {
+      document.addEventListener(eventName, resetInactivityTimer, true);
+    });
+    
+    // Iniciar timer
+    resetInactivityTimer();
+  }
+
+  // Verificar autenticación al cargar
+  if (window.location.pathname !== '/login.html') {
+    const token = getAuthToken();
+    
+    if (!token) {
+      console.log('[AUTH] No token found, redirecting to login');
+      window.location.href = '/login.html';
+      return; // IMPORTANTE: detener ejecución
+    }
+    
+    // Verificar token
+    fetch('/api/auth/verify', {
+      headers: { 'Authorization': `Bearer ${token}` }
+    })
+    .then(r => r.json())
+    .then(data => {
+      if (!data.valid) {
+        console.log('[AUTH] Token invalid, redirecting to login');
+        logout();
+        return;
+      }
+      
+      // Token válido, guardar datos del usuario
+      localStorage.setItem('user_data', JSON.stringify(data.user));
+      
+      // Mostrar mensaje de bienvenida minimalista
+      const userName = document.getElementById('userName');
+      if (userName && data.user) {
+        // Extraer primer nombre y primer apellido
+        const nombreCompleto = data.user.nombre || 'Usuario';
+        const nombrePartes = nombreCompleto.split(' ');
+        const primerNombre = nombrePartes[0];
+        const primerApellido = nombrePartes[1] || '';
+        const nombreCorto = primerApellido ? `${primerNombre} ${primerApellido}` : primerNombre;
+        
+        const cargo = data.user.cargo || '';
+        
+        // Formato: Bienvenido {Nombre} {Apellido} - {Cargo}
+        userName.textContent = `Bienvenido ${nombreCorto}${cargo ? ' - ' + cargo : ''}`;
+      }
+      
+      console.log('[AUTH] Logged in as:', data.user.nombre);
+    })
+    .catch(err => {
+      console.error('[AUTH] Verify error:', err);
+      logout();
+    });
+  }
+
+  // Interceptar todas las peticiones fetch para agregar token
+  const originalFetch = window.fetch;
+  window.fetch = function(...args) {
+    const token = getAuthToken();
+    
+    if (token) {
+      if (!args[1]) args[1] = {};
+      if (!args[1].headers) args[1].headers = {};
+      
+      args[1].headers['Authorization'] = `Bearer ${token}`;
+    }
+    
+    return originalFetch.apply(this, args)
+      .then(response => {
+        // Si es 401, redirigir a login
+        if (response.status === 401) {
+          console.log('[AUTH] 401 Unauthorized, logging out');
+          logout();
+        }
+        return response;
+      });
+  };
+
+  // ════════════════════════════════════════════════════
+  // DASHBOARD CODE (resto del código original)
+  // ════════════════════════════════════════════════════
+
   const $ = sel => document.querySelector(sel);
   const $$ = sel => document.querySelectorAll(sel);
   const escapeHtml = s => String(s || '').replace(/[&<>"']/g, m =>
     ({ '&':'&amp;', '<':'&lt;', '>':'&gt;', '"':'&quot;', "'":'&#39;' })[m]);
   
-  // Funciones helper para formatear estados y áreas
   const statusLabel = (status) => {
     const labels = {
       'open': 'Abierto',
@@ -34,9 +154,6 @@
     return labels[area?.toLowerCase()] || area;
   };
 
-  // ───────────────────────────────────────────────────────────
-  // DOM Elements
-  // ───────────────────────────────────────────────────────────
   const tbody = $('#tbody');
   const emptyBox = $('#emptyBox');
   const btnRefresh = $('#btnRefresh');
@@ -53,9 +170,6 @@
   const lastSyncEl = $('#lastSync');
   const connStatus = $('#connStatus');
 
-  // ───────────────────────────────────────────────────────────
-  // State
-  // ───────────────────────────────────────────────────────────
   let state = {
     q: '',
     area: '',
@@ -67,9 +181,6 @@
   let currentIncidentId = null;
   let currentFolio = null;
 
-  // ───────────────────────────────────────────────────────────
-  // API
-  // ───────────────────────────────────────────────────────────
   function buildQuery() {
     const p = new URLSearchParams();
     if (state.q) p.set('q', state.q);
@@ -112,9 +223,6 @@
     return res.json();
   }
 
-  // ───────────────────────────────────────────────────────────
-  // Formatters
-  // ───────────────────────────────────────────────────────────
   function fmtDate(iso) {
     if (!iso) return '—';
     const d = new Date(iso);
@@ -161,25 +269,15 @@
     return `<span class="badge" style="background:${color}">${area.toUpperCase()}</span>`;
   }
 
-  // ───────────────────────────────────────────────────────────
-  // Format Reporter Name
-  // ───────────────────────────────────────────────────────────
-  /**
-   * Formatea el nombre del reportador
-   * Prioridad: origin_display > origin_name (si no es chat_id) > eventos > chat_id formateado
-   */
   function formatReporter(inc) {
-    // 1. Si tenemos origin_display (ya viene formateado del bot)
     if (inc.origin_display && inc.origin_display !== inc.chat_id) {
       return escapeHtml(inc.origin_display);
     }
 
-    // 2. Si tenemos origin_name y NO es el chat_id
     if (inc.origin_name && inc.origin_name !== inc.chat_id && !inc.origin_name.includes('@')) {
       return escapeHtml(inc.origin_name);
     }
 
-    // 3. Buscar en los eventos el primer mensaje del solicitante
     if (inc.events && inc.events.length > 0) {
       for (const evt of inc.events) {
         if (evt.event_type === 'user_reply' || evt.event_type === 'initial_report' || evt.event_type === 'requester_feedback') {
@@ -192,14 +290,11 @@
       }
     }
 
-    // 4. Fallback: formatear el chat_id para hacerlo más legible
     const chatId = inc.origin_wa || inc.chat_id;
     if (chatId) {
-      // Si es un número de WhatsApp (ej: 5217751801318@c.us)
       const match = chatId.match(/^(\d+)@/);
       if (match) {
         const phone = match[1];
-        // Formatear como número de teléfono mexicano
         if (phone.length >= 12 && phone.startsWith('52')) {
           const formatted = '+' + phone.slice(0,2) + ' ' + phone.slice(2,5) + ' ' + phone.slice(5,8) + ' ' + phone.slice(8);
           return `<span class="text-muted">${escapeHtml(formatted)}</span>`;
@@ -212,9 +307,6 @@
     return '—';
   }
 
-  // ───────────────────────────────────────────────────────────
-  // Render Table
-  // ───────────────────────────────────────────────────────────
   function renderRows(rows) {
     if (!rows || !rows.length) {
       tbody.innerHTML = '';
@@ -235,7 +327,6 @@
       </tr>
     `).join('');
 
-    // Click handlers
     tbody.querySelectorAll('tr.row').forEach(tr => {
       tr.addEventListener('click', () => openDetail(tr.dataset.id));
     });
@@ -257,9 +348,6 @@
     }
   }
 
-  // ───────────────────────────────────────────────────────────
-  // Main Refresh
-  // ───────────────────────────────────────────────────────────
   async function refresh() {
     console.log('[UI] Refreshing...');
     try {
@@ -277,9 +365,6 @@
     }
   }
 
-  // ───────────────────────────────────────────────────────────
-  // Detail Modal with Chat
-  // ───────────────────────────────────────────────────────────
   async function openDetail(id) {
     try {
       const inc = await fetchIncidentDetail(id);
@@ -298,9 +383,6 @@
     currentFolio = null;
   }
 
-  // ───────────────────────────────────────────────────────────
-  // Actualizar solo el chat (sin re-renderizar todo el modal)
-  // ───────────────────────────────────────────────────────────
   function updateChatOnly(events, folio) {
     const chatMessages = document.getElementById('chatMessages');
     if (!chatMessages) {
@@ -311,7 +393,6 @@
     const newHtml = renderChatMessages(events, folio);
     chatMessages.innerHTML = newHtml;
     
-    // Scroll al final con animación suave
     requestAnimationFrame(() => {
       chatMessages.scrollTop = chatMessages.scrollHeight;
     });
@@ -320,14 +401,12 @@
     return true;
   }
 
-  // Actualizar el badge de estado en el modal
   function updateStatusBadge(status) {
     const statusSelect = document.getElementById('statusSelect');
     if (statusSelect && statusSelect.value !== status) {
       statusSelect.value = status;
     }
     
-    // También actualizar el badge visual
     const metaP = detailPanel.querySelector('.detail-meta');
     if (metaP) {
       const badgeSpan = metaP.querySelector('.badge');
@@ -343,7 +422,6 @@
   function renderDetail(inc) {
     const html = `
       <div class="detail-layout">
-        <!-- Panel Izquierdo: Info + Chat -->
         <div class="detail-left">
           <div class="detail-header">
             <div>
@@ -381,7 +459,6 @@
           ${renderAttachments(inc.attachments)}
         </div>
 
-        <!-- Panel Derecho: Chat -->
         <div class="detail-right">
           <div class="chat-container">
             <div class="chat-header">
@@ -401,20 +478,17 @@
 
     detailPanel.innerHTML = html;
 
-    // Scroll chat to bottom
     const chatMessages = $('#chatMessages');
     if (chatMessages) {
       chatMessages.scrollTop = chatMessages.scrollHeight;
     }
 
-    // Status change handler
     const statusSelect = detailPanel.querySelector('#statusSelect');
     if (statusSelect) {
       statusSelect.addEventListener('change', async () => {
         try {
           await updateIncidentStatus(inc.id, statusSelect.value);
           refresh();
-          // Recargar el detalle para actualizar el chat
           const updated = await fetchIncidentDetail(inc.id);
           renderDetail(updated);
         } catch (e) {
@@ -423,7 +497,6 @@
       });
     }
 
-    // Comment send handler
     const btnSend = $('#btnSendComment');
     const commentInput = $('#commentInput');
 
@@ -439,7 +512,6 @@
           await sendComment(inc.id, text);
           commentInput.value = '';
           
-          // Recargar solo el chat para ver el nuevo comentario
           const updated = await fetchIncidentDetail(inc.id);
           updateChatOnly(updated.events, updated.folio);
         } catch (e) {
@@ -460,9 +532,6 @@
     }
   }
 
-  // ───────────────────────────────────────────────────────────
-  // Render Chat Messages
-  // ───────────────────────────────────────────────────────────
   function renderChatMessages(events, folio) {
     if (!events || !events.length) {
       return '<div class="chat-empty">No hay mensajes aún</div>';
@@ -473,7 +542,7 @@
       let icon = '';
       let content = '';
       let author = '';
-      let side = 'system'; // 'left', 'right', 'system'
+      let side = 'system';
 
       switch (e.event_type) {
         case 'created':
@@ -497,30 +566,24 @@
           side = 'system';
           break;
 
-        // ✅ Mensajes/actualizaciones desde grupos de WhatsApp
         case 'group_status_update': {
           icon = '💬';
           content = payload.text || payload.note || 'Actualización desde grupo';
-          // author_name viene del bot con nombre y cargo (ej: "Gustavo Peralta (IT Auxiliar)")
           author = payload.author_name || payload.author || 'Equipo';
           side = 'left';
           break;
         }
 
-        // ✅ Feedback/notas del equipo desde grupos
         case 'team_feedback':
         case 'group_comment':
         case 'group_note': {
           icon = '💬';
           content = payload.raw_text || payload.text || payload.note || 'Nota del equipo';
-          // Intentar obtener el nombre: author_name ya resuelto, o author (que puede ser un @lid)
-          // Si es un @lid, el dashboard debería resolverlo, pero por ahora mostramos lo que hay
           author = payload.author_name || payload.authorDisplay || payload.author || 'Equipo';
           side = 'left';
           break;
         }
 
-        // Mensajes del solicitante (respuestas, feedback)
         case 'requester_feedback':
           icon = '💬';
           author = 'Solicitante';
@@ -531,7 +594,6 @@
         case 'initial_report':
         case 'user_reply':
           icon = '💬';
-          // Usar nombre del autor si está disponible
           author = payload.author_name || payload.sender_name || 'Solicitante';
           if (payload.author_role || payload.sender_role) {
             author += ` (${payload.author_role || payload.sender_role})`;
@@ -540,13 +602,11 @@
           side = 'left';
           break;
 
-        // ✅ FIX: el bot guarda comentarios como "comment_text"
         case 'comment_text': {
           icon = '💬';
           content = payload.text || '';
           const isDash = payload.by === 'dashboard' || payload.source === 'dashboard';
           side = isDash ? 'right' : 'left';
-          // Mostrar nombre del autor si está disponible
           if (isDash) {
             author = 'Dashboard';
           } else {
@@ -558,7 +618,6 @@
           break;
         }
 
-        // (compatibilidad) si algún día vuelves a emitir dashboard_comment
         case 'dashboard_comment':
           icon = '💬';
           author = 'Dashboard';
@@ -626,9 +685,6 @@
     `;
   }
 
-  // ───────────────────────────────────────────────────────────
-  // SSE (Server-Sent Events)
-  // ───────────────────────────────────────────────────────────
   let eventSource = null;
   let sseConnected = false;
   let autoRefreshTimer = null;
@@ -652,6 +708,19 @@
       console.log('[SSE] Connecting...');
       eventSource = new EventSource('/api/events');
 
+      window.eventSource = eventSource;
+      eventSource.addEventListener('open', () => {
+        console.log('[SSE] Conectado');
+        window.dispatchEvent(new Event('sse-connected'));
+      });
+
+      eventSource.addEventListener('error', (e) => {
+        console.error('[SSE] Error:', e);
+        if (eventSource.readyState === 2) {
+          window.dispatchEvent(new Event('sse-disconnected'));
+        }
+      });
+      
       eventSource.onopen = () => {
         console.log('[SSE] Connected');
         updateConnStatus(true);
@@ -662,23 +731,19 @@
         try {
           const data = JSON.parse(event.data);
           
-          // Ignorar pings y eventos de conexión
           if (data.type === 'ping' || data.type === 'connected') {
             return;
           }
           
           console.log('[SSE] Event received:', data.type, data.incidentId || data.folio || '');
 
-          // Tipos de eventos que requieren actualización
           const updateEvents = ['new_incident', 'status_change', 'incident_update', 'new_comment'];
           
           if (updateEvents.includes(data.type)) {
             console.log('[SSE] Processing update event:', data.type);
             
-            // Siempre refrescar la tabla principal
             refresh();
 
-            // Si el modal está abierto, actualizar el chat
             if (currentIncidentId && !overlay.classList.contains('hidden')) {
               console.log('[SSE] Updating open modal for:', currentFolio || currentIncidentId);
               
@@ -686,10 +751,8 @@
                 const updated = await fetchIncidentDetail(currentIncidentId);
                 console.log('[SSE] Fetched updated incident, events count:', updated.events?.length);
                 
-                // Actualizar solo el chat (más eficiente y evita parpadeos)
                 const chatUpdated = updateChatOnly(updated.events, updated.folio);
                 
-                // Si cambió el estado, actualizar el badge también
                 if (data.type === 'status_change' && data.status) {
                   updateStatusBadge(data.status);
                 }
@@ -740,9 +803,6 @@
     }
   }
 
-  // ───────────────────────────────────────────────────────────
-  // Event Listeners
-  // ───────────────────────────────────────────────────────────
   btnRefresh.addEventListener('click', () => {
     console.log('[UI] Manual refresh clicked');
     state.offset = 0;
@@ -799,7 +859,6 @@
     }
   });
 
-  // Visibility change
   document.addEventListener('visibilitychange', () => {
     if (document.hidden) {
       stopAutoRefresh();
@@ -813,10 +872,6 @@
     }
   });
 
-  // ═══════════════════════════════════════════════════════════════════════════
-  // MÓDULO DE REPORTES
-  // ═══════════════════════════════════════════════════════════════════════════
-
   const btnReports = $('#btnReports');
   const reportsOverlay = $('#reportsOverlay');
   const btnCloseReports = $('#btnCloseReports');
@@ -829,11 +884,8 @@
   const reportsPreviewBody = $('#reportsPreviewBody');
   const reportGenerating = $('#reportGenerating');
   const reportSuccess = $('#reportSuccess');
-  const reportDownloadLink = $('#reportDownloadLink');
 
-  // Abrir modal de reportes
   btnReports?.addEventListener('click', () => {
-    // Establecer fechas por defecto (último mes)
     const today = new Date();
     const lastMonth = new Date(today);
     lastMonth.setMonth(lastMonth.getMonth() - 1);
@@ -841,7 +893,6 @@
     reportEndDate.value = today.toISOString().split('T')[0];
     reportStartDate.value = lastMonth.toISOString().split('T')[0];
     
-    // Resetear estado
     reportsPreview.classList.add('hidden');
     reportGenerating.classList.add('hidden');
     reportSuccess.classList.add('hidden');
@@ -849,18 +900,22 @@
     reportsOverlay.classList.remove('hidden');
   });
 
-  // Cerrar modal de reportes
   btnCloseReports?.addEventListener('click', () => {
     reportsOverlay.classList.add('hidden');
+    reportsPreview.classList.add('hidden');
+    reportGenerating.classList.add('hidden');
+    reportSuccess.classList.add('hidden');
   });
 
   reportsOverlay?.addEventListener('click', (e) => {
     if (e.target === reportsOverlay) {
       reportsOverlay.classList.add('hidden');
+      reportsPreview.classList.add('hidden');
+      reportGenerating.classList.add('hidden');
+      reportSuccess.classList.add('hidden');
     }
   });
 
-  // Obtener filtros seleccionados
   function getReportFilters() {
     const areas = Array.from($$('.checkbox-group input[type="checkbox"][value]:checked'))
       .filter(cb => ['man', 'it', 'ama', 'rs', 'seg', 'exp'].includes(cb.value))
@@ -878,12 +933,10 @@
     };
   }
 
-  // Vista previa del reporte
   btnPreviewReport?.addEventListener('click', async () => {
     try {
       const filters = getReportFilters();
       
-      // Construir query params
       const params = new URLSearchParams();
       if (filters.startDate) params.set('startDate', filters.startDate);
       if (filters.endDate) params.set('endDate', filters.endDate);
@@ -896,10 +949,7 @@
       
       const data = await res.json();
       
-      // Mostrar estadísticas
       renderReportStats(data.stats);
-      
-      // Mostrar vista previa
       renderReportPreview(data.preview);
       
       reportsPreview.classList.remove('hidden');
@@ -910,7 +960,6 @@
     }
   });
 
-  // Renderizar estadísticas
   function renderReportStats(stats) {
     const statusLabels = {
       'open': 'Abiertos',
@@ -935,7 +984,6 @@
       </div>
     `;
     
-    // Estadísticas por estado
     Object.entries(stats.byStatus || {}).forEach(([status, count]) => {
       html += `
         <div class="stat-card">
@@ -945,7 +993,6 @@
       `;
     });
     
-    // Estadísticas por área
     Object.entries(stats.byArea || {}).forEach(([area, count]) => {
       html += `
         <div class="stat-card">
@@ -958,7 +1005,6 @@
     reportsStats.innerHTML = html;
   }
 
-  // Renderizar vista previa de tabla
   function renderReportPreview(preview) {
     if (!preview || preview.length === 0) {
       reportsPreviewBody.innerHTML = `
@@ -983,12 +1029,10 @@
     reportsPreviewBody.innerHTML = rows;
   }
 
-  // Generar reporte Excel
   btnGenerateReport?.addEventListener('click', async () => {
     try {
       const filters = getReportFilters();
       
-      // Mostrar spinner
       reportsPreview.classList.add('hidden');
       reportSuccess.classList.add('hidden');
       reportGenerating.classList.remove('hidden');
@@ -1010,33 +1054,117 @@
         throw new Error('No se pudo generar el reporte');
       }
       
-      // Mostrar éxito con link de descarga
       reportGenerating.classList.add('hidden');
       reportSuccess.classList.remove('hidden');
       
-      reportDownloadLink.href = data.downloadUrl;
-      reportDownloadLink.download = data.fileName;
-      
       console.log('[REPORTS] Report generated:', data.fileName);
+      
+      setTimeout(() => {
+        const a = document.createElement('a');
+        a.href = data.downloadUrl;
+        a.download = data.fileName || data.downloadUrl.split('/').pop();
+        document.body.appendChild(a);
+        a.click();
+        document.body.removeChild(a);
+        
+        console.log('[REPORTS] Auto-downloading:', data.fileName);
+        
+        setTimeout(() => {
+          reportSuccess.classList.add('hidden');
+        }, 3000);
+      }, 500);
       
     } catch (e) {
       console.error('[REPORTS] Generation error:', e);
       reportGenerating.classList.add('hidden');
-      alert('Error al generar el reporte: ' + e.message);
+      reportSuccess.classList.add('hidden');
+      alert('❌ Error al generar el reporte: ' + e.message);
     }
   });
 
-  // ═══════════════════════════════════════════════════════════════════════════
+  const newIncidentOverlay = $('#newIncidentOverlay');
+  const btnNewIncident = $('#btnNewIncident');
+  const btnCloseNew = $('#btnCloseNew');
+  const btnCancelNew = $('#btnCancelNew');
+  const newIncidentForm = $('#newIncidentForm');
+  const newRequesterSelect = $('#newRequester');
 
+  async function loadUsersForSelect() {
+    try {
+      const res = await fetch('/api/users');
+      const users = await res.json();
+      
+      newRequesterSelect.innerHTML = '<option value="">Selecciona un usuario</option>';
+      
+      Object.entries(users).forEach(([chatId, user]) => {
+        const option = document.createElement('option');
+        option.value = chatId;
+        option.textContent = `${user.nombre || user.name || chatId}${user.cargo ? ` (${user.cargo})` : ''}`;
+        newRequesterSelect.appendChild(option);
+      });
+    } catch (e) {
+      console.error('[UI] Error loading users:', e);
+      alert('Error cargando usuarios');
+    }
+  }
 
-  // ───────────────────────────────────────────────────────────
-  // Init
-  // ───────────────────────────────────────────────────────────
+  btnNewIncident?.addEventListener('click', async () => {
+    await loadUsersForSelect();
+    newIncidentOverlay?.classList.remove('hidden');
+    document.getElementById('newDescription')?.focus();
+  });
+
+  const closeNewModal = () => {
+    newIncidentOverlay?.classList.add('hidden');
+    newIncidentForm?.reset();
+  };
+
+  btnCloseNew?.addEventListener('click', closeNewModal);
+  btnCancelNew?.addEventListener('click', closeNewModal);
+  
+  newIncidentOverlay?.addEventListener('click', (e) => {
+    if (e.target === newIncidentOverlay) closeNewModal();
+  });
+
+  newIncidentForm?.addEventListener('submit', async (e) => {
+    e.preventDefault();
+    
+    const formData = new FormData(e.target);
+    const btnSubmit = $('#btnSubmitNew');
+    
+    btnSubmit.disabled = true;
+    btnSubmit.textContent = 'Creando...';
+    
+    try {
+      const res = await fetch('/api/incidents/create', {
+        method: 'POST',
+        body: formData
+      });
+      
+      if (!res.ok) {
+        const error = await res.json();
+        throw new Error(error.message || 'Error al crear incidencia');
+      }
+      
+      const result = await res.json();
+      
+      alert(`✅ Incidencia creada: ${result.folio}`);
+      closeNewModal();
+      refresh();
+      
+    } catch (err) {
+      console.error('[UI] Error creating incident:', err);
+      alert('❌ Error: ' + err.message);
+    } finally {
+      btnSubmit.disabled = false;
+      btnSubmit.textContent = 'Crear Incidencia';
+    }
+  });
+
   console.log('[UI] Initializing dashboard...');
   refresh();
   connectSSE();
 
-  // Fallback si SSE no conecta
   setTimeout(() => {
     if (!sseConnected && !autoRefreshTimer) {
       console.log('[AUTO] SSE timeout, starting polling');

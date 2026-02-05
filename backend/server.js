@@ -1,17 +1,19 @@
-// backend/server.js - Dashboard Vicebot (con Comentarios)
+// backend/server.js - Dashboard Vicebot (FIXED para better-sqlite3)
 
 const express = require('express');
 const cors = require('cors');
 const path = require('path');
 const fs = require('fs');
-
-// ══════════════════════════════════════════════════════════════════════════════
-// CONFIGURACIÓN
-// ══════════════════════════════════════════════════════════════════════════════
+const {
+  findUserByUsername,
+  validatePassword,
+  generateToken,
+  verifyToken,
+  requireAuth
+} = require('./auth-middleware');
 
 const PORT = Number(process.env.DASHBOARD_PORT) || 3031;
 
-// Rutas - Buscar la BD del bot
 const PROJECT_ROOT = process.env.VICEBOT_PROJECT_PATH || 
   path.resolve(__dirname, '..', '..', 'proyecto');
 
@@ -29,17 +31,17 @@ console.log('[BOOT] Attachments:', ATTACHMENTS_PATH);
 console.log('[BOOT] Users:', USERS_PATH);
 
 // ══════════════════════════════════════════════════════════════════════════════
-// USERS LOOKUP (para mostrar nombres en lugar de chat_id)
+// USERS LOOKUP
 // ══════════════════════════════════════════════════════════════════════════════
 
 let usersCache = {};
 let usersCacheTime = 0;
-const USERS_CACHE_TTL = 60000; // Recargar cada 60 segundos
+const USERS_CACHE_TTL = 60000;
 
 function loadUsers() {
   try {
     if (!fs.existsSync(USERS_PATH)) {
-      console.warn('[USERS] users.json not found at:', USERS_PATH);
+      console.warn('[USERS] users.json not found');
       return {};
     }
     const data = fs.readFileSync(USERS_PATH, 'utf8');
@@ -63,37 +65,28 @@ function getUsers() {
 
 /**
  * Obtiene el nombre formateado de un usuario por su chat_id
- * @param {string} chatId - ej: "5217751801318@c.us" o "220091455148195@lid"
- * @returns {string|null} - ej: "Gustavo Peralta (IT Auxiliar)" o null
  */
 function getUserDisplay(chatId) {
   if (!chatId) return null;
   const users = getUsers();
   
-  // Intento 1: Buscar directamente por el ID completo
   let user = users[chatId];
   
-  // Intento 2: Si es un @lid, extraer el número e intentar buscar con @c.us
   if (!user && chatId.includes('@lid')) {
     const num = chatId.split('@')[0];
-    // Buscar si existe con @c.us
     user = users[`${num}@c.us`];
   }
   
-  // Intento 3: Si es un @c.us, extraer el número e intentar buscar con @lid
   if (!user && chatId.includes('@c.us')) {
     const num = chatId.split('@')[0];
     user = users[`${num}@lid`];
   }
   
-  // Intento 4: Buscar por número parcial en todas las claves
   if (!user) {
     const num = chatId.split('@')[0];
-    // Solo buscar si el número tiene al menos 10 dígitos
     if (num && num.length >= 10) {
       for (const [key, val] of Object.entries(users)) {
         const keyNum = key.split('@')[0];
-        // Comparar los últimos 10 dígitos (por variaciones de código de país)
         if (keyNum.slice(-10) === num.slice(-10)) {
           user = val;
           break;
@@ -114,97 +107,86 @@ function getUserDisplay(chatId) {
 }
 
 // ══════════════════════════════════════════════════════════════════════════════
-// SQL.JS SETUP
+// BETTER-SQLITE3 SETUP
 // ══════════════════════════════════════════════════════════════════════════════
 
-const initSqlJs = require('sql.js');
-let SQL = null;
+const Database = require('better-sqlite3');
+let db = null;
 
-// Inicializar sql.js
-async function initDatabase() {
-  SQL = await initSqlJs();
-  console.log('[BOOT] sql.js initialized');
+function initializeDB() {
+  try {
+    if (!fs.existsSync(DB_PATH)) {
+      console.log('[BOOT] ⚠️  Base de datos no encontrada:', DB_PATH);
+      return;
+    }
+
+    db = new Database(DB_PATH, {
+      readonly: false,
+      fileMustExist: true,
+      timeout: 5000
+    });
+
+    db.pragma('journal_mode = WAL');
+    db.pragma('synchronous = NORMAL');
+    db.pragma('cache_size = 10000');
+
+    const tables = db.prepare("SELECT name FROM sqlite_master WHERE type='table'").all();
+    console.log('[BOOT] Tablas encontradas:', tables.map(t => t.name).join(', '));
+
+    const count = db.prepare('SELECT COUNT(*) as total FROM incidents').get();
+    console.log('[BOOT] Incidencias en BD:', count.total);
+
+    console.log('[BOOT] ✅ better-sqlite3 inicializado correctamente');
+  } catch (err) {
+    console.error('[BOOT] Error inicializando BD:', err);
+    db = null;
+  }
 }
 
-/**
- * Lee la BD combinando el archivo principal + WAL si existe
- */
 function withDb(callback) {
-  if (!fs.existsSync(DB_PATH)) {
+  if (!db) {
     throw new Error(`Database not found: ${DB_PATH}`);
   }
-  
-  // Leer el archivo principal
-  const buffer = fs.readFileSync(DB_PATH);
-  const db = new SQL.Database(buffer);
-  
   try {
     return callback(db);
-  } finally {
-    db.close();
+  } catch (err) {
+    console.error('[DB] Query error:', err.message);
+    throw err;
   }
 }
 
-/**
- * Ejecuta SELECT y devuelve array de objetos
- */
-function dbAll(db, sql, params = {}) {
-  try {
-    const stmt = db.prepare(sql);
-    stmt.bind(params);
-    
-    const results = [];
-    while (stmt.step()) {
-      const row = stmt.getAsObject();
-      results.push(row);
-    }
-    stmt.free();
-    return results;
-  } catch (e) {
-    console.error('[DB] Query error:', e.message);
-    console.error('[DB] SQL:', sql);
-    throw e;
-  }
-}
-
-/**
- * Ejecuta SELECT y devuelve un solo objeto o null
- */
-function dbGet(db, sql, params = {}) {
-  const results = dbAll(db, sql, params);
-  return results.length > 0 ? results[0] : null;
-}
-
-/**
- * Ejecuta INSERT/UPDATE/DELETE y guarda
- */
 function withDbWrite(callback) {
-  if (!fs.existsSync(DB_PATH)) {
+  if (!db) {
     throw new Error(`Database not found: ${DB_PATH}`);
   }
-  
-  const buffer = fs.readFileSync(DB_PATH);
-  const db = new SQL.Database(buffer);
-  
   try {
-    const result = callback(db);
-    const data = db.export();
-    const outBuffer = Buffer.from(data);
-    fs.writeFileSync(DB_PATH, outBuffer);
+    const result = db.transaction(() => {
+      return callback(db);
+    })();
     return result;
-  } finally {
-    db.close();
+  } catch (err) {
+    console.error('[DB] Write error:', err.message);
+    throw err;
   }
 }
 
-function dbRun(db, sql, params = {}) {
-  db.run(sql, params);
-  return { changes: db.getRowsModified() };
-}
+// ══════════════════════════════════════════════════════════════════════════════
+// EXPRESS APP
+// ══════════════════════════════════════════════════════════════════════════════
 
-// ══════════════════════════════════════════════════════════════════════════════
-// HELPERS
-// ══════════════════════════════════════════════════════════════════════════════
+const app = express();
+app.use(cors());
+app.use(express.json());
+
+// Servir login sin protección
+app.get('/login.html', (req, res) => {
+  res.sendFile(path.join(__dirname, '..', 'frontend', 'login.html'));
+});
+
+// Servir archivos estáticos SIN verificar token (el frontend lo maneja)
+app.use(express.static(path.join(__dirname, '..', 'frontend')));
+app.use('/attachments', express.static(ATTACHMENTS_PATH));
+console.log('[BOOT] Serving attachments from:', ATTACHMENTS_PATH);
 
 const safeParse = (s, def = []) => {
   if (!s) return def;
@@ -215,106 +197,760 @@ const safeParse = (s, def = []) => {
 const clamp = (n, min, max) => Math.max(min, Math.min(max, n));
 
 // ══════════════════════════════════════════════════════════════════════════════
-// EXPRESS APP
-// ══════════════════════════════════════════════════════════════════════════════
-
-const app = express();
-
-app.use(cors());
-app.use(express.json());
-
-// Frontend estático
-app.use(express.static(path.join(__dirname, '..', 'frontend')));
-
-// Servir attachments
-if (fs.existsSync(ATTACHMENTS_PATH)) {
-  app.use('/attachments', express.static(ATTACHMENTS_PATH));
-  console.log('[BOOT] Serving attachments from:', ATTACHMENTS_PATH);
-}
-
-// ══════════════════════════════════════════════════════════════════════════════
-// SSE (Server-Sent Events) para tiempo real
+// SSE
 // ══════════════════════════════════════════════════════════════════════════════
 
 const sseClients = new Set();
 
+function broadcastSSE(data) {
+  const msg = `data: ${JSON.stringify(data)}\n\n`;
+  let sent = 0;
+  for (const res of sseClients) {
+    try {
+      res.write(msg);
+      sent++;
+    } catch (e) {
+      sseClients.delete(res);
+    }
+  }
+  if (sent > 0) {
+    console.log(`[SSE] Broadcast to ${sent} clients:`, data.type);
+  }
+}
+
 app.get('/api/events', (req, res) => {
-  res.setHeader('Content-Type', 'text/event-stream');
-  res.setHeader('Cache-Control', 'no-cache');
-  res.setHeader('Connection', 'keep-alive');
-  res.setHeader('X-Accel-Buffering', 'no');
-  
-  // Enviar evento de conexión
+  res.writeHead(200, {
+    'Content-Type': 'text/event-stream',
+    'Cache-Control': 'no-cache',
+    'Connection': 'keep-alive',
+    'X-Accel-Buffering': 'no'
+  });
+
   res.write(`data: ${JSON.stringify({ type: 'connected' })}\n\n`);
   
   sseClients.add(res);
   console.log(`[SSE] Client connected (total: ${sseClients.size})`);
-  
-  // Heartbeat cada 25s para mantener conexión
-  const heartbeat = setInterval(() => {
-    res.write(`data: ${JSON.stringify({ type: 'ping', time: Date.now() })}\n\n`);
-  }, 25000);
-  
+
+  const pingInterval = setInterval(() => {
+    try {
+      res.write(`data: ${JSON.stringify({ type: 'ping', time: Date.now() })}\n\n`);
+    } catch {
+      clearInterval(pingInterval);
+    }
+  }, 30000);
+
   req.on('close', () => {
-    clearInterval(heartbeat);
+    clearInterval(pingInterval);
     sseClients.delete(res);
     console.log(`[SSE] Client disconnected (total: ${sseClients.size})`);
   });
 });
 
-function broadcastSSE(data) {
-  const msg = `data: ${JSON.stringify(data)}\n\n`;
-  sseClients.forEach(client => {
-    try {
-      client.write(msg);
-    } catch (e) {
-      sseClients.delete(client);
-    }
-  });
-  if (sseClients.size > 0) {
-    console.log(`[SSE] Broadcast to ${sseClients.size} clients:`, data.type);
-  }
-}
-
 // ══════════════════════════════════════════════════════════════════════════════
-// WEBHOOK para recibir notificaciones del bot
+// WEBHOOK
 // ══════════════════════════════════════════════════════════════════════════════
 
-app.post('/api/webhook/notify', (req, res) => {
-  const { type, incidentId, folio, status, eventType } = req.body;
-  
+app.post('/api/webhook/incident', express.json(), (req, res) => {
+  const { type, incidentId, folio, status } = req.body;
   console.log('[WEBHOOK] Received:', type, { incidentId, folio, status });
   
-  // Broadcast a todos los clientes SSE
-  broadcastSSE({ 
-    type: type || 'update', 
-    incidentId, 
-    folio, 
-    status,
-    eventType,
-    time: Date.now() 
+  broadcastSSE({
+    type: type || 'incident_update',
+    incidentId,
+    folio,
+    status
   });
   
-  res.json({ ok: true, clients: sseClients.size });
+  res.json({ ok: true });
+});
+
+// POST /api/auth/login
+app.post('/api/auth/login', (req, res) => {
+  const { username, password } = req.body;
+  
+  if (!username || !password) {
+    return res.status(400).json({ 
+      error: 'missing_credentials',
+      message: 'Usuario y contraseña son requeridos' 
+    });
+  }
+  
+  const user = findUserByUsername(username);
+  
+  if (!user) {
+    console.log(`[AUTH] User not found: ${username}`);
+    return res.status(401).json({ 
+      error: 'invalid_credentials',
+      message: 'Usuario no encontrado' 
+    });
+  }
+  
+  if (!validatePassword(user, password)) {
+    console.log(`[AUTH] Invalid password for: ${username}`);
+    return res.status(401).json({ 
+      error: 'invalid_credentials',
+      message: 'Contraseña incorrecta' 
+    });
+  }
+  
+  const token = generateToken(user);
+  
+  console.log(`[AUTH] ✅ Login successful: ${user.nombre} (${user.cargo})`);
+  
+  res.json({ 
+    ok: true,
+    token,
+    user: {
+      phoneId: user.phoneId,
+      nombre: user.nombre,
+      cargo: user.cargo,
+      rol: user.rol,
+      team: user.team
+    }
+  });
+});
+
+// GET /api/auth/verify
+app.get('/api/auth/verify', (req, res) => {
+  const authHeader = req.headers['authorization'];
+  
+  if (!authHeader) {
+    return res.json({ valid: false });
+  }
+  
+  const token = authHeader.replace('Bearer ', '');
+  const decoded = verifyToken(token);
+  
+  if (!decoded) {
+    return res.json({ valid: false });
+  }
+  
+  res.json({ 
+    valid: true,
+    user: {
+      phoneId: decoded.phoneId,
+      nombre: decoded.nombre,
+      cargo: decoded.cargo,
+      rol: decoded.rol,
+      team: decoded.team
+    }
+  });
+});
+
+// GET /api/auth/me
+app.get('/api/auth/me', requireAuth, (req, res) => {
+  res.json({ 
+    ok: true,
+    user: req.user
+  });
 });
 
 // ══════════════════════════════════════════════════════════════════════════════
 // API ENDPOINTS
 // ══════════════════════════════════════════════════════════════════════════════
 
-// Health check
-app.get('/api/health', (_req, res) => {
+app.get('/api/health', (req, res) => {
   const dbExists = fs.existsSync(DB_PATH);
   res.json({ 
     ok: dbExists, 
-    db: DB_PATH, 
-    dbExists,
-    time: new Date().toISOString() 
+    db: DB_PATH,
+    attachments: ATTACHMENTS_PATH,
+    users: USERS_PATH
   });
 });
 
-// Debug endpoint
-app.get('/api/debug', (req, res) => {
+app.get('/api/users', requireAuth, (req, res) => {
+  try {
+    const users = getUsers();
+    res.json(users);
+  } catch (e) {
+    console.error('[API] /users error', e);
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// GET /api/incidents
+app.get('/api/incidents', requireAuth, (req, res) => {
+  try {
+    const { status, area, q, sort, limit, offset } = req.query;
+    
+    const result = withDb(db => {
+      const where = [];
+      const params = [];
+
+      if (status) {
+        where.push('status = ?');
+        params.push(status);
+      }
+      if (area) {
+        where.push('area_destino = ?');
+        params.push(area.toUpperCase());
+      }
+      if (q) {
+        where.push('(descripcion LIKE ? OR interpretacion LIKE ? OR lugar LIKE ? OR folio LIKE ?)');
+        const qVal = `%${q}%`;
+        params.push(qVal, qVal, qVal, qVal);
+      }
+
+      const [sortFieldRaw, sortDirRaw] = String(sort || '').split(':');
+      const allowedSort = new Set(['created_at', 'updated_at', 'folio']);
+      const sortField = allowedSort.has(sortFieldRaw) ? sortFieldRaw : 'created_at';
+      const sortDir = (sortDirRaw || 'desc').toUpperCase() === 'ASC' ? 'ASC' : 'DESC';
+
+      const W = where.length ? ('WHERE ' + where.join(' AND ')) : '';
+      
+      const limitNum = clamp(Number(limit) || 50, 1, 200);
+      const offsetNum = Math.max(0, Number(offset) || 0);
+      
+      const totalParams = [...params];
+      const total = db.prepare(`SELECT COUNT(*) as total FROM incidents ${W}`).get(totalParams)?.total || 0;
+      
+      params.push(limitNum, offsetNum);
+      const rows = db.prepare(`
+        SELECT id, folio, created_at, updated_at, status, chat_id,
+               descripcion, interpretacion, lugar, area_destino, attachments_json
+        FROM incidents
+        ${W}
+        ORDER BY ${sortField} ${sortDir}
+        LIMIT ? OFFSET ?
+      `).all(params);
+      
+      return { total, rows };
+    });
+
+    const items = result.rows.map(r => ({
+      ...r,
+      attachments: safeParse(r.attachments_json, []),
+      // Resolver nombre para display usando chat_id
+      origin_display: getUserDisplay(r.chat_id) || r.chat_id
+    }));
+
+    res.json({ ok: true, total: result.total, items });
+  } catch (e) {
+    console.error('[API] /incidents error', e);
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// GET /api/incidents/:id
+app.get('/api/incidents/:id', requireAuth, (req, res) => {
+  try {
+    const { id } = req.params;
+    
+    const result = withDb(db => {
+      const incident = db.prepare(`
+        SELECT * FROM incidents 
+        WHERE id = ? OR folio = ?
+        LIMIT 1
+      `).get(id, id);
+      
+      if (!incident) return null;
+      
+      const events = db.prepare(`
+        SELECT * FROM incident_events 
+        WHERE incident_id = ?
+        ORDER BY created_at ASC
+      `).all(incident.id);
+      
+      return {
+        ...incident,
+        attachments: safeParse(incident.attachments_json, []),
+        // Resolver nombre para display usando chat_id
+        origin_display: getUserDisplay(incident.chat_id) || incident.chat_id,
+        events: events.map(e => ({
+          ...e,
+          payload: safeParse(e.payload_json, {})
+        }))
+      };
+    });
+
+    if (!result) {
+      return res.status(404).json({ error: 'Incident not found' });
+    }
+
+    res.json(result);
+  } catch (e) {
+    console.error('[API] /incidents/:id error', e);
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// PATCH /api/incidents/:id/status
+app.patch('/api/incidents/:id/status', requireAuth, (req, res) => {
+  try {
+    const { id } = req.params;
+    const { status } = req.body;
+    
+    const result = withDbWrite(db => {
+      const incident = db.prepare('SELECT id, status, folio FROM incidents WHERE id = ? OR folio = ?').get(id, id);
+      
+      if (!incident) return null;
+      
+      const oldStatus = incident.status;
+      const ts = new Date().toISOString();
+      const eventId = require('crypto').randomUUID();
+      
+      db.prepare('UPDATE incidents SET status = ?, updated_at = ? WHERE id = ?')
+        .run(status, ts, incident.id);
+      
+      db.prepare(`
+        INSERT INTO incident_events (id, incident_id, created_at, event_type, payload_json)
+        VALUES (?, ?, ?, 'status_change', ?)
+      `).run(
+        eventId,
+        incident.id,
+        ts,
+        JSON.stringify({ from: oldStatus, to: status, source: 'dashboard' })
+      );
+      
+      return { 
+        ok: true, 
+        folio: incident.folio,
+        oldStatus: oldStatus
+      };
+    });
+
+    if (!result) {
+      return res.status(404).json({ error: 'Incident not found' });
+    }
+
+    // Notificar al bot
+    fetch('http://localhost:3030/api/webhook/status-change', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        incidentId: id,
+        folio: result.folio,
+        from: result.oldStatus,
+        to: status,
+        source: 'dashboard'
+      })
+    }).then(r => {
+      console.log('[DASHBOARD] Bot notified:', r.ok ? 'OK' : 'FAILED');
+    }).catch(err => {
+      console.warn('[DASHBOARD] Bot notification failed:', err.message);
+    });
+
+    broadcastSSE({
+      type: 'status_change',
+      incidentId: id,
+      status
+    });
+
+    res.json({ ok: result.ok, folio: result.folio });
+  } catch (e) {
+    console.error('[API] PATCH status error', e);
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// POST /api/incidents/:id/comment
+app.post('/api/incidents/:id/comment', requireAuth, (req, res) => {
+  try {
+    const { id } = req.params;
+    const { text } = req.body;
+    
+    const result = withDbWrite(db => {
+      const incident = db.prepare('SELECT id, folio, chat_id, area_destino FROM incidents WHERE id = ? OR folio = ?').get(id, id);
+      
+      if (!incident) return null;
+      
+      const ts = new Date().toISOString();
+      const eventId = require('crypto').randomUUID();
+      
+      db.prepare(`
+        INSERT INTO incident_events (id, incident_id, created_at, event_type, payload_json)
+        VALUES (?, ?, ?, 'comment_text', ?)
+      `).run(
+        eventId,
+        incident.id,
+        ts,
+        JSON.stringify({ text, by: 'dashboard', source: 'dashboard' })
+      );
+      
+      return { 
+        ok: true, 
+        folio: incident.folio,
+        chat_id: incident.chat_id,
+        area_destino: incident.area_destino
+      };
+    });
+
+    if (!result) {
+      return res.status(404).json({ error: 'Incident not found' });
+    }
+
+    // Notificar al bot para que envíe el comentario
+    fetch('http://localhost:3030/api/webhook/comment', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        incidentId: id,
+        folio: result.folio,
+        chat_id: result.chat_id,
+        area_destino: result.area_destino,
+        text,
+        source: 'dashboard'
+      })
+    }).then(r => {
+      console.log('[DASHBOARD] Bot notified for comment:', r.ok ? 'OK' : 'FAILED');
+    }).catch(err => {
+      console.warn('[DASHBOARD] Bot notification failed:', err.message);
+    });
+
+    broadcastSSE({
+      type: 'new_comment',
+      incidentId: id
+    });
+
+    res.json({ ok: result.ok, folio: result.folio });
+  } catch (e) {
+    console.error('[API] POST comment error', e);
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// ══════════════════════════════════════════════════════════════════════════════
+// START SERVER
+// ══════════════════════════════════════════════════════════════════════════════
+
+initializeDB();
+
+app.listen(PORT, () => {
+  console.log('═══════════════════════════════════════════════════════════');
+  console.log('  🖥️  VICEBOT DASHBOARD');
+  console.log(`  📍 http://localhost:${PORT}`);
+  console.log('═══════════════════════════════════════════════════════════');
+});
+
+// ══════════════════════════════════════════════════════════════════════════════
+// REPORTES
+// ══════════════════════════════════════════════════════════════════════════════
+
+// GET /api/reports/preview
+app.get('/api/reports/preview', requireAuth, (req, res) => {
+  try {
+    const { startDate, endDate, areas, statuses, limit } = req.query;
+    
+    const result = withDb(db => {
+      const where = [];
+      const params = [];
+
+      if (startDate) {
+        where.push('created_at >= ?');
+        params.push(`${startDate}T00:00:00.000Z`);
+      }
+      if (endDate) {
+        where.push('created_at <= ?');
+        params.push(`${endDate}T23:59:59.999Z`);
+      }
+      if (areas) {
+        const areasList = areas.split(',').map(a => a.trim().toUpperCase());
+        where.push(`area_destino IN (${areasList.map(() => '?').join(',')})`);
+        params.push(...areasList);
+      }
+      if (statuses) {
+        const statusList = statuses.split(',').map(s => s.trim());
+        where.push(`status IN (${statusList.map(() => '?').join(',')})`);
+        params.push(...statusList);
+      }
+
+      const W = where.length ? ('WHERE ' + where.join(' AND ')) : '';
+      const limitNum = Math.min(Number(limit) || 100, 1000);
+
+      // Estadísticas
+      const total = db.prepare(`SELECT COUNT(*) as total FROM incidents ${W}`).get(params)?.total || 0;
+      
+      const byStatus = {};
+      const statusRows = db.prepare(`
+        SELECT status, COUNT(*) as count 
+        FROM incidents ${W}
+        GROUP BY status
+      `).all(params);
+      statusRows.forEach(r => { byStatus[r.status] = r.count; });
+
+      const byArea = {};
+      const areaRows = db.prepare(`
+        SELECT area_destino, COUNT(*) as count 
+        FROM incidents ${W}
+        GROUP BY area_destino
+      `).all(params);
+      areaRows.forEach(r => { byArea[r.area_destino] = r.count; });
+
+      // Vista previa
+      params.push(limitNum);
+      const preview = db.prepare(`
+        SELECT folio, created_at as fecha, status as estado, area_destino as area, 
+               lugar, descripcion
+        FROM incidents ${W}
+        ORDER BY created_at DESC
+        LIMIT ?
+      `).all(params);
+
+      return {
+        stats: { total, byStatus, byArea },
+        preview
+      };
+    });
+
+    res.json(result);
+  } catch (e) {
+    console.error('[API] /reports/preview error', e);
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// POST /api/reports/generate - PROFESIONAL
+app.post('/api/reports/generate', requireAuth, async (req, res) => {
+  try {
+    const { startDate, endDate, areas, statuses } = req.body;
+    
+    const ExcelJS = require('exceljs');
+    
+    // Helper functions para formato profesional
+    const COLORS = {
+      primary: 'CC7722',
+      primaryDark: 'A65D00',
+      lightGray: 'F8F9FA',
+      mediumGray: 'E9ECEF',
+      borderGray: 'DEE2E6',
+      statusOpen: 'E3F2FD',
+      statusProgress: 'FFF8E1',
+      statusDone: 'E8F5E9',
+      statusCanceled: 'FFEBEE',
+      white: 'FFFFFF',
+      textDark: '212529',
+      textMuted: '6C757D',
+    };
+    
+    const prettyStatus = (status) => {
+      const map = {
+        open: 'Abierto',
+        in_progress: 'En Progreso',
+        done: 'Completado',
+        canceled: 'Cancelado',
+      };
+      return map[status] || status;
+    };
+    
+    const prettyArea = (area) => {
+      const map = {
+        it: 'SISTEMAS',
+        mant: 'MANTENIMIENTO',
+        ama: 'AMA DE LLAVES',
+        seg: 'SEGURIDAD',
+        rs: 'ROOM SERVICE',
+        exp: 'EXPERIENCIAS',
+      };
+      return map[String(area || '').toLowerCase()] || String(area || '').toUpperCase();
+    };
+    
+    const applyStatusColor = (cell, status) => {
+      const colorMap = {
+        open: COLORS.statusOpen,
+        in_progress: COLORS.statusProgress,
+        done: COLORS.statusDone,
+        canceled: COLORS.statusCanceled,
+      };
+      const color = colorMap[status];
+      if (color) {
+        cell.fill = {
+          type: 'pattern',
+          pattern: 'solid',
+          fgColor: { argb: color }
+        };
+      }
+    };
+
+    // Obtener datos
+    const data = withDb(db => {
+      const where = [];
+      const params = [];
+
+      if (startDate) {
+        where.push('created_at >= ?');
+        params.push(`${startDate}T00:00:00.000Z`);
+      }
+      if (endDate) {
+        where.push('created_at <= ?');
+        params.push(`${endDate}T23:59:59.999Z`);
+      }
+      if (areas && areas.length > 0) {
+        const areasList = areas.map(a => a.toUpperCase());
+        where.push(`area_destino IN (${areasList.map(() => '?').join(',')})`);
+        params.push(...areasList);
+      }
+      if (statuses && statuses.length > 0) {
+        where.push(`status IN (${statuses.map(() => '?').join(',')})`);
+        params.push(...statuses);
+      }
+
+      const W = where.length ? ('WHERE ' + where.join(' AND ')) : '';
+
+      return db.prepare(`
+        SELECT folio, created_at, status, area_destino, lugar, descripcion, 
+               chat_id, updated_at
+        FROM incidents ${W}
+        ORDER BY created_at DESC
+      `).all(params);
+    });
+
+    // Crear workbook
+    const workbook = new ExcelJS.Workbook();
+    const worksheet = workbook.addWorksheet('Incidencias');
+
+    // Definir columnas
+    const columns = [
+      { header: 'Folio', key: 'folio', width: 15 },
+      { header: 'Estado', key: 'status', width: 18 },
+      { header: 'Área', key: 'area', width: 18 },
+      { header: 'Ubicación', key: 'lugar', width: 25 },
+      { header: 'Descripción', key: 'descripcion', width: 50 },
+      { header: 'Reportado por', key: 'reportado_por', width: 30 },
+      { header: 'Fecha Creación', key: 'created', width: 20 },
+      { header: 'Última Actualización', key: 'updated', width: 20 }
+    ];
+    
+    worksheet.columns = columns;
+
+    // Agregar datos
+    data.forEach(row => {
+      worksheet.addRow({
+        folio: row.folio,
+        status: prettyStatus(row.status),
+        area: prettyArea(row.area_destino),
+        lugar: row.lugar,
+        descripcion: row.descripcion,
+        reportado_por: getUserDisplay(row.chat_id) || row.chat_id,
+        created: new Date(row.created_at).toLocaleString('es-MX', { timeZone: 'America/Mexico_City' }),
+        updated: new Date(row.updated_at).toLocaleString('es-MX', { timeZone: 'America/Mexico_City' })
+      });
+    });
+
+    // HEADER PROFESIONAL
+    worksheet.spliceRows(1, 0, [], []);
+    
+    // Fila 1: Título
+    worksheet.getRow(1).height = 40;
+    worksheet.mergeCells(1, 1, 1, columns.length);
+    const titleCell = worksheet.getCell(1, 1);
+    titleCell.value = '📊  REPORTE DE INCIDENCIAS';
+    titleCell.font = { bold: true, size: 18, color: { argb: COLORS.white } };
+    titleCell.fill = { type: 'pattern', pattern: 'solid', fgColor: { argb: COLORS.primary } };
+    titleCell.alignment = { horizontal: 'center', vertical: 'middle' };
+    
+    for (let col = 1; col <= columns.length; col++) {
+      worksheet.getCell(1, col).fill = { type: 'pattern', pattern: 'solid', fgColor: { argb: COLORS.primary } };
+    }
+    
+    // Fila 2: Subtítulo
+    worksheet.getRow(2).height = 22;
+    worksheet.mergeCells(2, 1, 2, columns.length);
+    const subtitleCell = worksheet.getCell(2, 1);
+    
+    const subtitleParts = [];
+    if (startDate && endDate) {
+      subtitleParts.push(`Periodo: ${startDate} - ${endDate}`);
+    } else {
+      subtitleParts.push('Periodo: Todo el historial');
+    }
+    if (areas?.length) {
+      subtitleParts.push(`Áreas: ${areas.map(a => prettyArea(a)).join(', ')}`);
+    } else {
+      subtitleParts.push('Áreas: Todas');
+    }
+    subtitleParts.push(`Generado: ${new Date().toLocaleString('es-MX', { timeZone: 'America/Mexico_City' })}`);
+    
+    subtitleCell.value = subtitleParts.join('  │  ');
+    subtitleCell.font = { italic: true, size: 10, color: { argb: COLORS.textMuted } };
+    subtitleCell.fill = { type: 'pattern', pattern: 'solid', fgColor: { argb: COLORS.mediumGray } };
+    subtitleCell.alignment = { horizontal: 'center', vertical: 'middle' };
+    
+    for (let col = 1; col <= columns.length; col++) {
+      worksheet.getCell(2, col).fill = { type: 'pattern', pattern: 'solid', fgColor: { argb: COLORS.mediumGray } };
+    }
+    
+    // Fila 3: Headers
+    worksheet.getRow(3).height = 28;
+    for (let col = 1; col <= columns.length; col++) {
+      const cell = worksheet.getCell(3, col);
+      cell.font = { bold: true, size: 11, color: { argb: COLORS.white } };
+      cell.fill = { type: 'pattern', pattern: 'solid', fgColor: { argb: COLORS.primaryDark } };
+      cell.alignment = { horizontal: 'center', vertical: 'middle', wrapText: true };
+      cell.border = {
+        top: { style: 'medium', color: { argb: COLORS.primaryDark } },
+        bottom: { style: 'medium', color: { argb: COLORS.primaryDark } },
+        left: { style: 'thin', color: { argb: COLORS.primaryDark } },
+        right: { style: 'thin', color: { argb: COLORS.primaryDark } },
+      };
+    }
+    
+    // Estilizar filas de datos
+    const dataStartRow = 4;
+    const dataEndRow = 3 + data.length;
+    
+    for (let row = dataStartRow; row <= dataEndRow; row++) {
+      const isEven = (row - dataStartRow) % 2 === 0;
+      const statusValue = data[row - 4]?.status;
+      
+      for (let col = 1; col <= columns.length; col++) {
+        const cell = worksheet.getCell(row, col);
+        cell.font = { size: 10, color: { argb: COLORS.textDark } };
+        cell.alignment = { vertical: 'middle', wrapText: true };
+        cell.border = {
+          top: { style: 'thin', color: { argb: COLORS.borderGray } },
+          bottom: { style: 'thin', color: { argb: COLORS.borderGray } },
+          left: { style: 'thin', color: { argb: COLORS.borderGray } },
+          right: { style: 'thin', color: { argb: COLORS.borderGray } },
+        };
+        
+        // Filas alternas (excepto columna de estado)
+        if (!isEven && col !== 2) {
+          cell.fill = {
+            type: 'pattern',
+            pattern: 'solid',
+            fgColor: { argb: COLORS.lightGray }
+          };
+        }
+        
+        // Color de estado (columna 2)
+        if (col === 2) {
+          applyStatusColor(cell, statusValue);
+        }
+      }
+    }
+    
+    // Filtros automáticos y freeze
+    worksheet.autoFilter = `A3:H3`;
+    worksheet.views = [{ state: 'frozen', ySplit: 3 }];
+
+    // Generar archivo
+    const timestamp = new Date().toISOString().replace(/[:.]/g, '-').slice(0, 19);
+    const filename = `incidencias_${timestamp.replace('T', '_').slice(0, 15).replace(/-/g, '')}.xlsx`;
+    const filepath = path.join(ATTACHMENTS_PATH, filename);
+
+    await workbook.xlsx.writeFile(filepath);
+
+    res.json({
+      ok: true,
+      fileName: filename,
+      downloadUrl: `/attachments/${filename}`,
+      recordCount: data.length
+    });
+
+  } catch (e) {
+    console.error('[API] /reports/generate error', e);
+    res.status(500).json({ ok: false, error: e.message });
+  }
+});
+
+
+// ══════════════════════════════════════════════════════════════════════════════
+// ENDPOINTS ADICIONALES
+// ══════════════════════════════════════════════════════════════════════════════
+
+// GET /api/debug - Información de debug
+app.get('/api/debug', requireAuth, (req, res) => {
   try {
     const dbExists = fs.existsSync(DB_PATH);
     const walExists = fs.existsSync(DB_PATH + '-wal');
@@ -337,18 +973,16 @@ app.get('/api/debug', (req, res) => {
     if (dbExists) {
       try {
         const result = withDb(db => {
-          // Listar tablas
-          const tablesResult = dbAll(db, "SELECT name FROM sqlite_master WHERE type='table'");
+          const tablesResult = db.prepare("SELECT name FROM sqlite_master WHERE type='table'").all();
           const tableNames = tablesResult.map(t => t.name);
           
-          // Si existe la tabla incidents, contar
           let count = 0;
           let sample = [];
           
           if (tableNames.includes('incidents')) {
-            const countResult = dbGet(db, 'SELECT COUNT(*) as c FROM incidents');
+            const countResult = db.prepare('SELECT COUNT(*) as c FROM incidents').get();
             count = countResult?.c || 0;
-            sample = dbAll(db, 'SELECT id, folio, status, created_at FROM incidents ORDER BY created_at DESC LIMIT 5');
+            sample = db.prepare('SELECT id, folio, status, created_at FROM incidents ORDER BY created_at DESC LIMIT 5').all();
           }
           
           return { tables: tableNames, count, sample };
@@ -382,504 +1016,7 @@ app.get('/api/debug', (req, res) => {
   }
 });
 
-// GET /api/incidents - Lista
-app.get('/api/incidents', (req, res) => {
-  try {
-    const { status, area, q, sort, limit, offset } = req.query;
-    
-    const result = withDb(db => {
-      const where = [];
-      const params = {};
-
-      if (status) {
-        where.push('status = $status');
-        params.$status = status;
-      }
-      if (area) {
-        where.push('area_destino = $area');
-        params.$area = area.toUpperCase();
-      }
-      if (q) {
-        where.push('(descripcion LIKE $q OR interpretacion LIKE $q OR lugar LIKE $q OR folio LIKE $q)');
-        params.$q = `%${q}%`;
-      }
-
-      const [sortFieldRaw, sortDirRaw] = String(sort || '').split(':');
-      const allowedSort = new Set(['created_at', 'updated_at', 'folio']);
-      const sortField = allowedSort.has(sortFieldRaw) ? sortFieldRaw : 'created_at';
-      const sortDir = (sortDirRaw || 'desc').toUpperCase() === 'ASC' ? 'ASC' : 'DESC';
-
-      const W = where.length ? ('WHERE ' + where.join(' AND ')) : '';
-      
-      const limitNum = clamp(Number(limit) || 50, 1, 200);
-      const offsetNum = Math.max(0, Number(offset) || 0);
-      
-      params.$limit = limitNum;
-      params.$offset = offsetNum;
-
-      const total = dbGet(db, `SELECT COUNT(*) as total FROM incidents ${W}`, params)?.total || 0;
-      
-      const rows = dbAll(db, `
-        SELECT id, folio, created_at, updated_at, status, chat_id,
-               descripcion, interpretacion, lugar, area_destino, attachments_json
-        FROM incidents
-        ${W}
-        ORDER BY ${sortField} ${sortDir}
-        LIMIT $limit OFFSET $offset
-      `, params);
-      
-      return { total, rows };
-    });
-
-    if (result.error) {
-      console.warn('[API] /incidents warning:', result.error);
-    }
-
-    const items = (result.rows || []).map(r => {
-      const atts = safeParse(r.attachments_json, []);
-      const first = Array.isArray(atts) && atts.length ? atts[0] : null;
-      return {
-        id: r.id,
-        folio: r.folio,
-        created_at: r.created_at,
-        updated_at: r.updated_at,
-        status: r.status,
-        descripcion: r.descripcion,
-        interpretacion: r.interpretacion,
-        lugar: r.lugar,
-        area_destino: r.area_destino,
-        attachments_count: Array.isArray(atts) ? atts.length : 0,
-        first_attachment_url: first?.url || null,
-      };
-    });
-
-    const limitNum = clamp(Number(limit) || 50, 1, 200);
-    const offsetNum = Math.max(0, Number(offset) || 0);
-    const page = Math.floor(offsetNum / limitNum) + 1;
-
-    res.json({
-      items,
-      total: result.total || 0,
-      page,
-      limit: limitNum,
-      offset: offsetNum,
-      rows: items  // Alias para compatibilidad
-    });
-    
-  } catch (e) {
-    console.error('[API] /incidents error', e);
-    res.status(500).json({ 
-      error: 'internal_error', 
-      message: e.message,
-      items: [],
-      total: 0
-    });
-  }
-});
-
-// GET /api/incidents/:id - Detalle
-app.get('/api/incidents/:id', (req, res) => {
-  try {
-    const { id } = req.params;
-    
-    const result = withDb(db => {
-      const incident = dbGet(db, `
-        SELECT * FROM incidents 
-        WHERE id = $id OR folio = $id
-        LIMIT 1
-      `, { $id: id });
-      
-      if (!incident) return null;
-      
-      const events = dbAll(db, `
-        SELECT id, event_type, payload_json, created_at, wa_msg_id
-        FROM incident_events
-        WHERE incident_id = $incidentId
-        ORDER BY created_at ASC
-      `, { $incidentId: incident.id });
-      
-      return { incident, events };
-    });
-    
-    if (!result || !result.incident) {
-      return res.status(404).json({ error: 'not_found' });
-    }
-    
-    const inc = result.incident;
-    const atts = safeParse(inc.attachments_json, []);
-    const areas = safeParse(inc.areas_json, []);
-    const notes = safeParse(inc.notes_json, []);
-    
-    // Calcular origin_display: usar el de BD si existe, sino buscar en users.json
-    const originWa = inc.origin_name || inc.chat_id || null;
-    const originDisplay = inc.origin_display || getUserDisplay(inc.chat_id) || getUserDisplay(inc.origin_name);
-    
-    res.json({
-      id: inc.id,
-      folio: inc.folio,
-      created_at: inc.created_at,
-      updated_at: inc.updated_at,
-      status: inc.status,
-      chat_id: inc.chat_id,
-      descripcion: inc.descripcion,
-      interpretacion: inc.interpretacion,
-      lugar: inc.lugar,
-      building: inc.building,
-      floor: inc.floor,
-      room: inc.room,
-      area_destino: inc.area_destino,
-      areas,
-      notes,
-      origin_name: inc.origin_name,
-      origin_display: originDisplay,  // Nombre formateado del solicitante
-      origin_wa: inc.origin_wa || inc.chat_id,  // WhatsApp ID original
-      attachments: atts,
-      events: (result.events || []).map(e => {
-        const payload = safeParse(e.payload_json, {});
-        
-        // Resolver el nombre del autor si es un ID de WhatsApp
-        if (payload.author && !payload.author_name) {
-          const resolved = getUserDisplay(payload.author);
-          if (resolved && resolved !== payload.author) {
-            payload.author_name = resolved;
-          }
-        }
-        
-        return {
-          id: e.id,
-          event_type: e.event_type,
-          payload,
-          created_at: e.created_at,
-          wa_msg_id: e.wa_msg_id
-        };
-      })
-    });
-    
-  } catch (e) {
-    console.error('[API] /incidents/:id error', e);
-    res.status(500).json({ error: 'internal_error', message: e.message });
-  }
-});
-
-// PATCH /api/incidents/:id/status - Cambiar estado
-app.patch('/api/incidents/:id/status', async (req, res) => {
-  try {
-    const { id } = req.params;
-    const { status } = req.body;
-    
-    if (!status) {
-      return res.status(400).json({ error: 'missing_status' });
-    }
-    
-    const allowed = ['open', 'in_progress', 'done', 'canceled'];
-    if (!allowed.includes(status)) {
-      return res.status(400).json({ error: 'invalid_status', allowed });
-    }
-    
-    const result = withDbWrite(db => {
-      const incident = dbGet(db, 'SELECT id, status, folio FROM incidents WHERE id = $id OR folio = $id', { $id: id });
-      if (!incident) return null;
-      
-      const ts = new Date().toISOString();
-      const eventId = require('crypto').randomUUID();
-      
-      db.run(`UPDATE incidents SET status = $status, updated_at = $ts WHERE id = $id`, {
-        $id: incident.id,
-        $status: status,
-        $ts: ts
-      });
-      
-      db.run(`
-        INSERT INTO incident_events (id, incident_id, created_at, event_type, payload_json)
-        VALUES ($id, $incidentId, $ts, 'status_change', $payload)
-      `, {
-        $id: eventId,
-        $incidentId: incident.id,
-        $ts: ts,
-        $payload: JSON.stringify({ from: incident.status, to: status, source: 'dashboard' })
-      });
-      
-      return { id: incident.id, folio: incident.folio, from: incident.status, to: status };
-    });
-    
-    if (!result) {
-      return res.status(404).json({ error: 'not_found' });
-    }
-    
-    // Broadcast del cambio a clientes SSE
-    broadcastSSE({ type: 'status_change', ...result });
-    
-    // ─────────────────────────────────────────────────────────────
-    // Notificar al BOT para que envíe mensajes por WhatsApp
-    // ─────────────────────────────────────────────────────────────
-    const BOT_WEBHOOK_URL = process.env.BOT_WEBHOOK_URL || 'http://localhost:3030/api/webhook/status-change';
-    
-    try {
-      const botResponse = await fetch(BOT_WEBHOOK_URL, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          incidentId: result.id,
-          folio: result.folio,
-          from: result.from,
-          to: result.to,
-          source: 'dashboard'
-        })
-      });
-      
-      const botData = await botResponse.json().catch(() => ({}));
-      console.log('[DASHBOARD] Bot notified:', botData.ok ? 'OK' : botData.error || 'failed');
-      
-      res.json({ ok: true, ...result, botNotified: botData.ok || false });
-    } catch (botErr) {
-      // El bot puede no estar corriendo, no es crítico
-      console.warn('[DASHBOARD] Could not notify bot:', botErr?.message || 'connection failed');
-      res.json({ ok: true, ...result, botNotified: false, botError: 'connection_failed' });
-    }
-    
-  } catch (e) {
-    console.error('[API] PATCH status error', e);
-    res.status(500).json({ error: 'internal_error', message: e.message });
-  }
-});
-
-// ══════════════════════════════════════════════════════════════════════════════
-// MÓDULO DE REPORTES
-// ══════════════════════════════════════════════════════════════════════════════
-
-// GET /api/reports/preview - Vista previa de datos para reporte
-app.get('/api/reports/preview', (req, res) => {
-  try {
-    const { startDate, endDate, areas, statuses, limit = 100 } = req.query;
-    
-    // ═══════════════════════════════════════════════════════════════
-    // 🔥 LOG: Ver qué filtros recibe
-    // ═══════════════════════════════════════════════════════════════
-    console.log('[PREVIEW] ═══════════════════════════════════════');
-    console.log('[PREVIEW] Query params:', req.query);
-    console.log('[PREVIEW] startDate:', startDate, 'type:', typeof startDate);
-    console.log('[PREVIEW] endDate:', endDate, 'type:', typeof endDate);
-    console.log('[PREVIEW] areas:', areas, 'type:', typeof areas);
-    console.log('[PREVIEW] statuses:', statuses, 'type:', typeof statuses);
-    console.log('[PREVIEW] ═══════════════════════════════════════');
-    
-    let conditions = [];
-    let params = {};
-    
-    // Filtro por fechas
-    if (startDate) {
-      conditions.push('created_at >= $startDate');
-      params.$startDate = `${startDate}T00:00:00.000Z`;
-    }
-    if (endDate) {
-      conditions.push('created_at <= $endDate');
-      params.$endDate = `${endDate}T23:59:59.999Z`;
-    }
-    
-    // Filtro por áreas (puede ser string, array, o string separado por comas)
-    if (areas) {
-      let areaList = [];
-      
-      if (Array.isArray(areas)) {
-        areaList = areas;
-      } else if (typeof areas === 'string') {
-        areaList = areas.split(',').map(a => a.trim()).filter(Boolean);
-      }
-      
-      if (areaList.length > 0) {
-        conditions.push(`LOWER(area_destino) IN (${areaList.map((_, i) => `$area${i}`).join(', ')})`);
-        areaList.forEach((area, i) => {
-          params[`$area${i}`] = String(area).toLowerCase();
-        });
-      }
-    }
-    
-    // Filtro por estados (puede ser string, array, o string separado por comas)
-    if (statuses) {
-      let statusList = [];
-      
-      if (Array.isArray(statuses)) {
-        statusList = statuses;
-      } else if (typeof statuses === 'string') {
-        statusList = statuses.split(',').map(s => s.trim()).filter(Boolean);
-      }
-      
-      if (statusList.length > 0) {
-        conditions.push(`LOWER(status) IN (${statusList.map((_, i) => `$status${i}`).join(', ')})`);
-        statusList.forEach((status, i) => {
-          params[`$status${i}`] = String(status).toLowerCase();
-        });
-      }
-    }
-    
-    const whereClause = conditions.length > 0 ? `WHERE ${conditions.join(' AND ')}` : '';
-    
-    // ═══════════════════════════════════════════════════════════════
-    // 🔥 LOG: Ver query construida
-    // ═══════════════════════════════════════════════════════════════
-    console.log('[PREVIEW] ───────────────────────────────────────');
-    console.log('[PREVIEW] WHERE:', whereClause);
-    console.log('[PREVIEW] Params:', JSON.stringify(params, null, 2));
-    console.log('[PREVIEW] ───────────────────────────────────────');
-    
-    const result = withDb(db => {
-      // Total de registros que cumplen filtros
-      const countRow = dbGet(db, `SELECT COUNT(*) as total FROM incidents ${whereClause}`, params);
-      const total = countRow?.total || 0;
-      
-      // Obtener muestra de datos
-      const sql = `
-        SELECT 
-          id, folio, created_at, updated_at, status, 
-          area_destino, lugar, descripcion, origin_name
-        FROM incidents 
-        ${whereClause}
-        ORDER BY created_at DESC
-        LIMIT $limit
-      `;
-      
-      const incidents = dbAll(db, sql, { ...params, $limit: Number(limit) });
-      
-      // Estadísticas rápidas
-      const stats = {
-        total,
-        byStatus: {},
-        byArea: {}
-      };
-      
-      // Contar por estado y área (sobre todos los registros, no solo la muestra)
-      const allIncidents = dbAll(db, `SELECT status, area_destino FROM incidents ${whereClause}`, params);
-      
-      allIncidents.forEach(inc => {
-        const status = inc.status || 'open';
-        const area = inc.area_destino || 'sin_area';
-        stats.byStatus[status] = (stats.byStatus[status] || 0) + 1;
-        stats.byArea[area] = (stats.byArea[area] || 0) + 1;
-      });
-      
-      return { incidents, stats };
-    });
-    
-    // ═══════════════════════════════════════════════════════════════
-    // 🔥 LOG: Ver resultados
-    // ═══════════════════════════════════════════════════════════════
-    console.log('[PREVIEW] ───────────────────────────────────────');
-    console.log('[PREVIEW] Incidencias encontradas:', result.incidents?.length || 0);
-    console.log('[PREVIEW] Stats:', JSON.stringify(result.stats, null, 2));
-    console.log('[PREVIEW] ───────────────────────────────────────');
-    
-    res.json({
-      ok: true,
-      preview: result.incidents.map(inc => ({
-        folio: inc.folio,
-        fecha: inc.created_at,
-        estado: inc.status,
-        area: inc.area_destino,
-        lugar: inc.lugar,
-        descripcion: (inc.descripcion || '').substring(0, 100)
-      })),
-      stats: result.stats,
-      filters: { startDate, endDate, areas, statuses }
-    });
-    
-  } catch (e) {
-    console.error('[API] /reports/preview error', e);
-    res.status(500).json({ error: 'internal_error', message: e.message });
-  }
-});
-
-// POST /api/reports/generate - Generar archivo Excel
-app.post('/api/reports/generate', async (req, res) => {
-  try {
-    const { startDate, endDate, areas, statuses } = req.body;
-    
-    // Validar que exportXLSX.js existe
-    const exportPath = path.join(PROJECT_ROOT, 'modules', 'reports', 'exportXLSX.js');
-    if (!fs.existsSync(exportPath)) {
-      return res.status(500).json({ 
-        error: 'export_module_not_found',
-        message: 'Módulo de exportación no encontrado',
-        path: exportPath
-      });
-    }
-    
-    // ═══════════════════════════════════════════════════════════════
-    // 🔥 CRITICAL: Limpiar caché del módulo para forzar recarga
-    // ═══════════════════════════════════════════════════════════════
-    delete require.cache[require.resolve(exportPath)];
-    
-    // ═══════════════════════════════════════════════════════════════
-    // 🔥 IMPORTANTE: Establecer las rutas correctas ANTES de importar
-    // Las constantes de exportXLSX se evalúan al momento de require()
-    // ═══════════════════════════════════════════════════════════════
-    process.env.VICEBOT_DB_PATH = DB_PATH;
-    process.env.VICEBOT_USERS_PATH = USERS_PATH;
-    process.env.VICEBOT_REPORTS_DIR = path.join(PROJECT_ROOT, 'data', 'reports');
-    
-    // Importar el módulo de exportación (DESPUÉS de configurar env vars)
-    const { exportXLSX } = require(exportPath);
-    
-    // ═══════════════════════════════════════════════════════════════
-    // 🔥 DEBUG: Verificar que la BD existe y hacer WAL checkpoint
-    // ═══════════════════════════════════════════════════════════════
-    console.log('[REPORTS] DB_PATH:', DB_PATH);
-    console.log('[REPORTS] DB exists:', fs.existsSync(DB_PATH));
-    console.log('[REPORTS] WAL exists:', fs.existsSync(DB_PATH + '-wal'));
-    
-    // Hacer checkpoint del WAL para asegurar que los datos estén en el archivo principal
-    try {
-      const sqlite3 = require('better-sqlite3');
-      const tempDb = sqlite3(DB_PATH);
-      
-      // Verificar tablas
-      const tables = tempDb.prepare("SELECT name FROM sqlite_master WHERE type='table'").all();
-      console.log('[REPORTS] Tables found:', tables.map(t => t.name).join(', '));
-      
-      // Hacer checkpoint
-      tempDb.pragma('wal_checkpoint(PASSIVE)');
-      console.log('[REPORTS] WAL checkpoint done');
-      
-      tempDb.close();
-    } catch (checkErr) {
-      console.warn('[REPORTS] Checkpoint failed:', checkErr.message);
-    }
-    
-    // Configurar opciones de exportación
-    const options = {};
-    if (startDate) options.startDate = startDate;
-    if (endDate) options.endDate = endDate;
-    if (areas && areas.length > 0) options.areas = areas;
-    if (statuses && statuses.length > 0) options.statuses = statuses;
-    
-    // ═══════════════════════════════════════════════════════════════
-    // 🔥 FIX: exportXLSX abre su propia conexión con better-sqlite3
-    // NO pasar la conexión de sql.js porque son incompatibles
-    // ═══════════════════════════════════════════════════════════════
-    const filePath = await exportXLSX(options);
-    
-    if (!filePath || !fs.existsSync(filePath)) {
-      throw new Error('El archivo no fue generado correctamente');
-    }
-    
-    const fileName = path.basename(filePath);
-    
-    res.json({
-      ok: true,
-      fileName,
-      downloadUrl: `/api/reports/download/${fileName}`,
-      filePath
-    });
-    
-  } catch (e) {
-    console.error('[API] /reports/generate error', e);
-    res.status(500).json({ 
-      error: 'generation_failed', 
-      message: e.message 
-    });
-  }
-});
-
-// GET /api/reports/download/:filename - Descargar archivo generado
+// GET /api/reports/download/:filename
 app.get('/api/reports/download/:filename', (req, res) => {
   try {
     const { filename } = req.params;
@@ -889,10 +1026,7 @@ app.get('/api/reports/download/:filename', (req, res) => {
       return res.status(400).json({ error: 'invalid_filename' });
     }
     
-    const REPORTS_DIR = process.env.VICEBOT_REPORTS_DIR || 
-      path.join(PROJECT_ROOT, 'data', 'reports');
-    
-    const filePath = path.join(REPORTS_DIR, filename);
+    const filePath = path.join(ATTACHMENTS_PATH, filename);
     
     if (!fs.existsSync(filePath)) {
       return res.status(404).json({ error: 'file_not_found' });
@@ -913,123 +1047,103 @@ app.get('/api/reports/download/:filename', (req, res) => {
   }
 });
 
-// ══════════════════════════════════════════════════════════════════════════════
-// POST /api/incidents/:id/comment - Agregar comentario
-// El dashboard NO escribe a la BD - solo envía al bot que es el único escritor
-// ══════════════════════════════════════════════════════════════════════════════
-app.post('/api/incidents/:id/comment', async (req, res) => {
+// POST /api/incidents/create - Crear nueva incidencia desde dashboard
+const multer = require('multer');
+const upload = multer({ storage: multer.memoryStorage() });
+
+app.post('/api/incidents/create', requireAuth, upload.array('attachments', 5), async (req, res) => {
   try {
-    const { id } = req.params;
-    const { text } = req.body;
+    const { descripcion, area_destino, lugar, chat_id } = req.body;
+    const files = req.files || [];
     
-    if (!text || !text.trim()) {
-      return res.status(400).json({ error: 'missing_text' });
+    // Validar campos requeridos
+    if (!descripcion || !area_destino || !lugar || !chat_id) {
+      return res.status(400).json({ 
+        error: 'missing_fields',
+        message: 'Faltan campos requeridos: descripcion, area_destino, lugar, chat_id'
+      });
     }
     
-    const commentText = text.trim();
+    // Preparar datos para el bot
+    const incidentData = {
+      descripcion: descripcion.trim(),
+      area_destino: area_destino.toUpperCase(),
+      lugar: lugar.trim(),
+      chat_id: chat_id.trim(),
+      source: 'dashboard',
+      attachments: files.map(f => ({
+        filename: f.originalname,
+        mimetype: f.mimetype,
+        size: f.size,
+        data: f.buffer.toString('base64')
+      }))
+    };
     
-    // Solo leer info del incidente, NO escribir
-    const incident = withDb(db => {
-      return dbGet(db, 'SELECT id, folio, chat_id, area_destino FROM incidents WHERE id = $id OR folio = $id', { $id: id });
+    console.log('[DASHBOARD] Creating incident from dashboard:', {
+      area: incidentData.area_destino,
+      lugar: incidentData.lugar,
+      chat_id: incidentData.chat_id,
+      attachments: incidentData.attachments.length
     });
     
-    if (!incident) {
-      return res.status(404).json({ error: 'not_found' });
-    }
+    // Enviar al BOT para que cree la incidencia y notifique
+    const BOT_WEBHOOK_URL = process.env.BOT_WEBHOOK_URL || 'http://localhost:3030/api/webhook/create-incident';
     
-    // ─────────────────────────────────────────────────────────────
-    // Enviar al BOT - él guarda en la BD y envía por WhatsApp
-    // ─────────────────────────────────────────────────────────────
-    const BOT_WEBHOOK_URL = process.env.BOT_WEBHOOK_URL || 'http://localhost:3030/api/webhook/comment';
-    
-    let botResult = { ok: false, error: 'not_sent' };
     try {
       const botResponse = await fetch(BOT_WEBHOOK_URL, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          incidentId: incident.id,
-          folio: incident.folio,
-          chat_id: incident.chat_id,
-          area_destino: incident.area_destino,
-          text: commentText,
-          source: 'dashboard'
-        })
+        body: JSON.stringify(incidentData)
       });
       
-      botResult = await botResponse.json().catch(() => ({ ok: false, error: 'parse_error' }));
-      console.log('[DASHBOARD] Bot notified for comment:', botResult.ok ? 'OK' : botResult.error || 'failed');
+      if (!botResponse.ok) {
+        const botError = await botResponse.json().catch(() => ({}));
+        throw new Error(botError.message || `Bot returned ${botResponse.status}`);
+      }
+      
+      const botResult = await botResponse.json();
+      console.log('[DASHBOARD] Incident created by bot:', botResult.folio);
+      
+      // Broadcast a clientes SSE
+      broadcastSSE({ 
+        type: 'new_incident', 
+        incidentId: botResult.incidentId,
+        folio: botResult.folio
+      });
+      
+      res.json({ 
+        ok: true, 
+        incidentId: botResult.incidentId,
+        folio: botResult.folio,
+        message: 'Incidencia creada correctamente'
+      });
       
     } catch (botErr) {
-      console.warn('[DASHBOARD] Could not notify bot for comment:', botErr?.message || 'connection failed');
-      botResult = { ok: false, error: botErr?.message || 'connection_failed' };
-    }
-    
-    if (!botResult.ok) {
+      console.error('[DASHBOARD] Bot error creating incident:', botErr.message);
       return res.status(502).json({ 
         error: 'bot_unavailable', 
-        message: 'No se pudo enviar el comentario. Verifica que el bot esté corriendo.',
-        details: botResult.error
+        message: 'No se pudo crear la incidencia. Verifica que el bot esté corriendo.',
+        details: botErr.message
       });
     }
     
-    // Broadcast a clientes SSE para que refresquen
-    broadcastSSE({ 
-      type: 'new_comment', 
-      incidentId: incident.id, 
-      folio: incident.folio,
-      text: commentText
-    });
-    
-    res.json({ 
-      ok: true, 
-      incidentId: incident.id,
-      folio: incident.folio,
-      botNotified: true
-    });
-    
   } catch (e) {
-    console.error('[API] POST comment error', e);
+    console.error('[API] POST /incidents/create error', e);
     res.status(500).json({ error: 'internal_error', message: e.message });
   }
 });
 
-// ══════════════════════════════════════════════════════════════════════════════
-// INICIO DEL SERVIDOR
-// ══════════════════════════════════════════════════════════════════════════════
-
-async function start() {
-  await initDatabase();
+// POST /api/webhook/notify - Webhook alternativo
+app.post('/api/webhook/notify', express.json(), (req, res) => {
+  const { type, incidentId, folio, status } = req.body;
+  console.log('[WEBHOOK] Notify received:', type, { incidentId, folio, status });
   
-  app.listen(PORT, () => {
-    console.log('═══════════════════════════════════════════════════════════');
-    console.log('  🖥️  VICEBOT DASHBOARD');
-    console.log(`  📍 http://localhost:${PORT}`);
-    console.log('═══════════════════════════════════════════════════════════');
-    
-    // Verificar BD al inicio
-    if (fs.existsSync(DB_PATH)) {
-      try {
-        withDb(db => {
-          const tables = dbAll(db, "SELECT name FROM sqlite_master WHERE type='table'");
-          console.log('[BOOT] Tablas encontradas:', tables.map(t => t.name).join(', ') || '(ninguna)');
-          
-          if (tables.some(t => t.name === 'incidents')) {
-            const count = dbGet(db, 'SELECT COUNT(*) as c FROM incidents');
-            console.log('[BOOT] Incidencias en BD:', count?.c || 0);
-          }
-        });
-      } catch (e) {
-        console.warn('[BOOT] Error leyendo BD:', e.message);
-        console.warn('[BOOT] Esto puede ser normal si el bot está escribiendo (WAL)');
-      }
-    } else {
-      console.warn('[BOOT] ⚠️  Base de datos no encontrada:', DB_PATH);
-    }
+  broadcastSSE({
+    type: type || 'incident_update',
+    incidentId,
+    folio,
+    status
   });
-}
-
-start().catch(e => {
-  console.error('[FATAL]', e);
-  process.exit(1);
+  
+  res.json({ ok: true });
 });

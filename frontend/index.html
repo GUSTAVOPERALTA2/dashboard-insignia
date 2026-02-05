@@ -8,16 +8,24 @@
 </head>
 <body>
   <div class="container">
-    <!-- Header -->
+    <!-- Header con layout reorganizado -->
     <header class="header">
-      <h1>
-        Incidencias 
-        <span id="connStatus" class="conn-status conn-polling" title="Estado de conexión">●</span>
-      </h1>
-      <div class="header-actions">
-        <span class="text-muted">Última sync: <span id="lastSync">—</span></span>
-        <button id="btnReports" class="btn btn-secondary">📊 Reportes</button>
-        <button id="btnRefresh" class="btn btn-primary">↻ Actualizar</button>
+      <div class="header-left">
+        <h1>
+          Incidencias
+          <span id="connection-indicator" class="connection-status"></span>
+        </h1>
+        <span id="userName" class="user-welcome"></span>
+      </div>
+      
+      <div class="header-right">
+        <div class="header-buttons">
+          <button id="btnReports" class="btn btn-secondary">📊 Reportes</button>
+          <button id="btnNewIncident" class="btn btn-success">+ Nueva Incidencia</button>
+          <button id="btnRefresh" class="btn-reload" title="Actualizar"></button>
+          <button onclick="logout()" class="btn-power" title="Cerrar Sesión"></button>
+        </div>
+        <span class="sync-info">Última sync: <span id="lastSync">—</span></span>
       </div>
     </header>
 
@@ -86,59 +94,157 @@
     </div>
   </div>
 
+  <!-- Modal de nueva incidencia -->
+  <div id="newIncidentOverlay" class="overlay hidden">
+    <div class="modal modal-form">
+      <button id="btnCloseNew" class="btn-close">✕</button>
+      <div class="modal-header">
+        <h2>📝 Nueva Incidencia</h2>
+      </div>
+      <form id="newIncidentForm" class="incident-form">
+        <div class="form-group">
+          <label for="newDescription">Descripción <span class="required">*</span></label>
+          <textarea 
+            id="newDescription" 
+            name="descripcion" 
+            rows="4" 
+            placeholder="Describe el problema o solicitud..."
+            required
+          ></textarea>
+        </div>
+
+        <div class="form-row">
+          <div class="form-group">
+            <label for="newArea">Área Destino <span class="required">*</span></label>
+            <select id="newArea" name="area_destino" required>
+              <option value="">Selecciona un área</option>
+              <option value="IT">IT</option>
+              <option value="MAN">Mantenimiento</option>
+              <option value="AMA">AMA de Llaves</option>
+              <option value="RS">Room Service</option>
+              <option value="SEG">Seguridad</option>
+              <option value="EXP">Experiencias</option>
+            </select>
+          </div>
+
+          <div class="form-group">
+            <label for="newLocation">Ubicación <span class="required">*</span></label>
+            <input 
+              type="text" 
+              id="newLocation" 
+              name="lugar" 
+              placeholder="Ej: Habitación 3304, Lobby, Sistemas..."
+              required
+            />
+          </div>
+        </div>
+
+        <div class="form-group">
+          <label for="newRequester">Emisor/Solicitante <span class="required">*</span></label>
+          <select id="newRequester" name="chat_id" required>
+            <option value="">Selecciona un usuario</option>
+          </select>
+        </div>
+
+        <div class="form-group">
+          <label for="newAttachments">Adjuntos (opcional)</label>
+          <input 
+            type="file" 
+            id="newAttachments" 
+            name="attachments" 
+            multiple 
+            accept="image/*,video/*,.pdf"
+          />
+          <small class="help-text">Puedes subir imágenes, videos o PDFs</small>
+        </div>
+
+        <div class="form-actions">
+          <button type="button" id="btnCancelNew" class="btn btn-secondary">Cancelar</button>
+          <button type="submit" id="btnSubmitNew" class="btn btn-success">Crear Incidencia</button>
+        </div>
+      </form>
+    </div>
+  </div>
+
   <!-- Modal de reportes -->
   <div id="reportsOverlay" class="overlay hidden">
     <div class="modal modal-reports">
       <button id="btnCloseReports" class="btn-close">✕</button>
       
-      <div class="reports-content">
-        <h2>Generar Reporte de Incidencias</h2>
-        
-        <!-- Filtros -->
-        <section class="reports-filters">
-          <div class="filter-group">
-            <label>Rango de Fechas</label>
-            <div class="date-range">
-              <input type="date" id="reportStartDate" class="form-input">
-              <span>—</span>
-              <input type="date" id="reportEndDate" class="form-input">
-            </div>
+      <div class="modal-header">
+        <h2>📊 Generar Reporte de Incidencias</h2>
+      </div>
+      
+      <div class="report-form">
+        <div class="form-section">
+          <h3>Rango de Fechas</h3>
+          <div class="date-inputs">
+            <input type="date" id="reportStartDate" class="form-input">
+            <span>hasta</span>
+            <input type="date" id="reportEndDate" class="form-input">
           </div>
-          
-          <div class="filter-group">
-            <label>Áreas</label>
-            <div class="checkbox-group">
-              <label><input type="checkbox" value="man" checked> Mantenimiento</label>
-              <label><input type="checkbox" value="it" checked> IT</label>
-              <label><input type="checkbox" value="ama" checked> AMA</label>
-              <label><input type="checkbox" value="rs" checked> Room Service</label>
-              <label><input type="checkbox" value="seg" checked> Seguridad</label>
-              <label><input type="checkbox" value="exp" checked> Experiencias</label>
-            </div>
+        </div>
+
+        <div class="form-section">
+          <h3>Áreas</h3>
+          <div class="checkbox-group">
+            <label>
+              <input type="checkbox" value="man" checked>
+              <span>Mantenimiento</span>
+            </label>
+            <label>
+              <input type="checkbox" value="it" checked>
+              <span>IT</span>
+            </label>
+            <label>
+              <input type="checkbox" value="ama" checked>
+              <span>AMA</span>
+            </label>
+            <label>
+              <input type="checkbox" value="rs" checked>
+              <span>Room Service</span>
+            </label>
+            <label>
+              <input type="checkbox" value="seg" checked>
+              <span>Seguridad</span>
+            </label>
+            <label>
+              <input type="checkbox" value="exp" checked>
+              <span>Experiencias</span>
+            </label>
           </div>
-          
-          <div class="filter-group">
-            <label>Estados</label>
-            <div class="checkbox-group">
-              <label><input type="checkbox" value="open" checked> Abiertos</label>
-              <label><input type="checkbox" value="in_progress" checked> En Progreso</label>
-              <label><input type="checkbox" value="done" checked> Completados</label>
-              <label><input type="checkbox" value="canceled" checked> Cancelados</label>
-            </div>
+        </div>
+
+        <div class="form-section">
+          <h3>Estados</h3>
+          <div class="checkbox-group">
+            <label>
+              <input type="checkbox" value="open" checked>
+              <span>Abiertos</span>
+            </label>
+            <label>
+              <input type="checkbox" value="in_progress" checked>
+              <span>En Progreso</span>
+            </label>
+            <label>
+              <input type="checkbox" value="done" checked>
+              <span>Completados</span>
+            </label>
+            <label>
+              <input type="checkbox" value="canceled" checked>
+              <span>Cancelados</span>
+            </label>
           </div>
-          
-          <div class="reports-actions">
-            <button id="btnPreviewReport" class="btn btn-secondary">👁️ Vista Previa</button>
-            <button id="btnGenerateReport" class="btn btn-primary">📥 Generar Excel</button>
-          </div>
-        </section>
-        
-        <!-- Vista previa -->
-        <section id="reportsPreview" class="reports-preview hidden">
+        </div>
+
+        <div class="report-actions">
+          <button id="btnPreviewReport" class="btn btn-secondary">👁 Vista Previa</button>
+          <button id="btnGenerateReport" class="btn btn-primary">📊 Generar y Descargar</button>
+        </div>
+
+        <div id="reportsPreview" class="hidden">
           <h3>Vista Previa</h3>
-          
-          <div id="reportsStats" class="reports-stats"></div>
-          
+          <div id="reportsStats" class="stats-grid"></div>
           <div class="preview-table-container">
             <table class="table">
               <thead>
@@ -154,27 +260,21 @@
               <tbody id="reportsPreviewBody"></tbody>
             </table>
           </div>
-          
-          <div class="preview-note">
-            <small>Esta es una muestra de hasta 100 registros. El reporte completo incluirá todos los registros que cumplan los filtros.</small>
-          </div>
-        </section>
-        
-        <!-- Estado de generación -->
-        <div id="reportGenerating" class="report-status hidden">
-          <div class="spinner"></div>
-          <p>Generando reporte...</p>
         </div>
-        
-        <div id="reportSuccess" class="report-status hidden">
-          <div class="success-icon">✓</div>
-          <p>Reporte generado exitosamente</p>
-          <a id="reportDownloadLink" class="btn btn-primary" download>⬇️ Descargar Excel</a>
+
+        <div id="reportGenerating" class="hidden report-status">
+          <div class="spinner"></div>
+          <p>⏳ Generando reporte...</p>
+        </div>
+
+        <div id="reportSuccess" class="hidden report-status">
+          <p>✅ Reporte generado y descargado exitosamente</p>
         </div>
       </div>
     </div>
   </div>
-
+  
+  <script src="connection-indicator.js"></script>
   <script src="app.js"></script>
 </body>
 </html>
